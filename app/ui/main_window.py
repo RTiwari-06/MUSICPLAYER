@@ -125,6 +125,14 @@ class MainWindow(ctk.CTk):
         self._session_files = 0
         self._session_bytes = 0
 
+        # Track-selection state
+        self._fetched_count = 0
+        self._track_vars: list = []
+        self._track_texts: list = []
+        self._is_fetching = False
+        self._selection_mode = False
+        self._fetch_warnings = 0
+
         # Configure grid weights for responsive layout
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -133,10 +141,12 @@ class MainWindow(ctk.CTk):
         self.main_container = ctk.CTkFrame(self, fg_color="transparent")
         self.main_container.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
         self.main_container.grid_columnconfigure(0, weight=1)
-        self.main_container.grid_rowconfigure(3, weight=1)
+        self.main_container.grid_rowconfigure(2, weight=2)
+        self.main_container.grid_rowconfigure(4, weight=3)
 
         self._build_header()
         self._build_download_section()
+        self._build_selection_section()
         self._build_progress_section()
         self._build_log_section()
         self._build_status_bar()
@@ -239,7 +249,21 @@ class MainWindow(ctk.CTk):
             hover_color=CTA_HOVER,
             command=self._start_download,
         )
-        self.download_button.grid(row=1, column=1, padx=(0, 15), pady=(0, 8), sticky="e")
+        self.download_button.grid(row=1, column=1, padx=(0, 8), pady=(0, 8), sticky="e")
+
+        self.fetch_button = ctk.CTkButton(
+            self.download_frame,
+            text="Fetch Tracks",
+            width=140,
+            height=40,
+            corner_radius=12,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=ACCENT_GREEN,
+            hover_color="#27ae60",
+            text_color="#0f172a",
+            command=self._start_fetch,
+        )
+        self.fetch_button.grid(row=1, column=2, padx=(0, 15), pady=(0, 8), sticky="e")
 
         self.output_label = ctk.CTkLabel(
             self.download_frame,
@@ -248,7 +272,7 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=10),
             text_color=TEXT_SECONDARY_DARK,
         )
-        self.output_label.grid(row=2, column=0, padx=15, pady=(0, 10), sticky="ew")
+        self.output_label.grid(row=2, column=0, columnspan=2, padx=15, pady=(0, 10), sticky="ew")
 
         self.browse_button = GlassButton(
             self.download_frame,
@@ -258,12 +282,72 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=10),
             command=self._browse_folder,
         )
-        self.browse_button.grid(row=2, column=1, padx=(0, 15), pady=(0, 10), sticky="e")
+        self.browse_button.grid(row=2, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
+
+    def _build_selection_section(self) -> None:
+        """Build the track selection panel (hidden until tracks are fetched)."""
+        self.selection_frame = GlassFrame(self.main_container, corner_radius=20)
+        self.selection_frame.grid(row=2, column=0, pady=(0, 10), sticky="nsew")
+        self.selection_frame.grid_columnconfigure(0, weight=1)
+        self.selection_frame.grid_rowconfigure(2, weight=1)
+
+        self.selection_header = ctk.CTkLabel(
+            self.selection_frame,
+            text="Select Tracks",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+            text_color=TEXT_PRIMARY_DARK,
+        )
+        self.selection_header.grid(row=0, column=0, padx=15, pady=(10, 2), sticky="w")
+
+        self.selection_summary_label = ctk.CTkLabel(
+            self.selection_frame,
+            text="0 of 0 selected",
+            font=ctk.CTkFont(size=10),
+            anchor="w",
+            text_color=TEXT_SECONDARY_DARK,
+        )
+        self.selection_summary_label.grid(row=1, column=0, padx=15, pady=(0, 5), sticky="w")
+
+        # Toolbar with selection and download actions
+        toolbar = ctk.CTkFrame(self.selection_frame, fg_color="transparent")
+        toolbar.grid(row=0, column=1, rowspan=2, padx=(0, 15), pady=(10, 5), sticky="ne")
+        self.select_all_btn = GlassButton(
+            toolbar, text="Select All", width=90, height=26,
+            font=ctk.CTkFont(size=10), command=lambda: self._set_all_tracks(True),
+        )
+        self.select_all_btn.grid(row=0, column=0, padx=4)
+        self.select_none_btn = GlassButton(
+            toolbar, text="Select None", width=90, height=26,
+            font=ctk.CTkFont(size=10), command=lambda: self._set_all_tracks(False),
+        )
+        self.select_none_btn.grid(row=0, column=1, padx=4)
+        self.invert_sel_btn = GlassButton(
+            toolbar, text="Invert", width=70, height=26,
+            font=ctk.CTkFont(size=10), command=self._invert_tracks,
+        )
+        self.invert_sel_btn.grid(row=0, column=2, padx=4)
+        self.download_selected_btn = ctk.CTkButton(
+            toolbar, text="Download Selected", width=150, height=28,
+            corner_radius=12, font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=ACCENT_BLUE, hover_color=CTA_HOVER,
+            command=self._download_selected,
+        )
+        self.download_selected_btn.grid(row=1, column=0, columnspan=3, padx=4, pady=(6, 0))
+
+        # Scrollable checkbox list
+        self.track_scroll = ctk.CTkScrollableFrame(
+            self.selection_frame, fg_color="transparent", label_text=""
+        )
+        self.track_scroll.grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 12), sticky="nsew")
+        self.track_scroll.grid_columnconfigure(0, weight=1)
+
+        self.selection_frame.grid_remove()
 
     def _build_progress_section(self) -> None:
         """Build the progress bar, song counter, and cancel control section."""
         self.progress_frame = GlassFrame(self.main_container, corner_radius=20)
-        self.progress_frame.grid(row=2, column=0, pady=(0, 10), sticky="ew")
+        self.progress_frame.grid(row=3, column=0, pady=(0, 10), sticky="ew")
         self.progress_frame.grid_columnconfigure(1, weight=1)
 
         self.track_label = ctk.CTkLabel(
@@ -334,7 +418,7 @@ class MainWindow(ctk.CTk):
     def _build_log_section(self) -> None:
         """Build the log display section."""
         self.log_frame = GlassFrame(self.main_container, corner_radius=20)
-        self.log_frame.grid(row=3, column=0, pady=(0, 10), sticky="nsew")
+        self.log_frame.grid(row=4, column=0, pady=(0, 10), sticky="nsew")
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(1, weight=1)
 
@@ -380,7 +464,7 @@ class MainWindow(ctk.CTk):
     def _build_status_bar(self) -> None:
         """Build the bottom status bar with session statistics."""
         self.status_frame = GlassFrame(self.main_container, corner_radius=12)
-        self.status_frame.grid(row=4, column=0, pady=(0, 0), sticky="ew")
+        self.status_frame.grid(row=5, column=0, pady=(0, 0), sticky="ew")
         self.status_frame.grid_columnconfigure(0, weight=1)
 
         self.status_bar = ctk.CTkLabel(
@@ -644,6 +728,21 @@ class MainWindow(ctk.CTk):
             percent = status.get("percent", None)
             is_fallback = status.get("fallback", False)
 
+            # Fetch-mode protocol events
+            if stat == "fetched":
+                track = status.get("track") or {}
+                self._add_track_row(track)
+                self.track_label.configure(text=f"Fetching... {self._fetched_count} tracks loaded")
+                return
+            if stat == "fetch_error":
+                self._end_fetch()
+                self.track_label.configure(text="Fetch Failed")
+                self.status_bar.configure(text="Fetch failed - see log")
+                self._log(status.get("message") or "Fetch failed", status="error")
+                return
+            if stat == "downloading" and self._is_fetching and status.get("warning"):
+                self._fetch_warnings += 1
+
             # Show fallback badge
             if is_fallback or "[FALLBACK]" in msg:
                 self._fallback_active = True
@@ -678,6 +777,20 @@ class MainWindow(ctk.CTk):
                     pass
 
             if stat == "completed":
+                if self._is_fetching:
+                    partial = bool(status.get("partial")) or self._fetch_warnings > 0
+                    if partial:
+                        detail = status.get("message") or (
+                            f"Fetched {self._fetched_count} track(s), "
+                            f"{self._fetch_warnings} issue(s) reported"
+                        )
+                        self._log(f"PARTIAL FETCH - {detail}", status="warning")
+                        self._end_fetch(message="Fetch incomplete - see log")
+                    else:
+                        self._log(f"Fetched {self._fetched_count} track(s)", status="success")
+                        self._end_fetch()
+                    self.track_label.configure(text="Tracks fetched - select and download")
+                    return
                 self.track_label.configure(text="Download Completed")
                 self._set_downloading_state(False)
                 self.progress_bar.set(1.0)
@@ -686,6 +799,12 @@ class MainWindow(ctk.CTk):
                 self._log(msg or "Download completed", status="success")
                 self._refresh_session_stats()
             elif stat == "error":
+                if self._is_fetching:
+                    self._end_fetch()
+                    self.track_label.configure(text="Fetch Failed")
+                    self.status_bar.configure(text="Fetch failed - see log")
+                    self._log(msg or "Fetch failed", status="error")
+                    return
                 err_type = status.get("type", "")
                 self.track_label.configure(text=f"Download Failed ({err_type})" if err_type else "Download Failed")
                 self._set_downloading_state(False)
@@ -693,19 +812,53 @@ class MainWindow(ctk.CTk):
                 self._log(msg or "Download failed", status="error")
         self.after(0, _update)
 
+    def _end_fetch(self, message: str = "Track list ready") -> None:
+        """Restore controls after a fetch finishes (success, error or cancel)."""
+        self._is_fetching = False
+        self.status_bar.configure(text=message)
+        try:
+            self.progress_bar.stop()
+        except Exception:
+            pass
+        self.progress_bar.configure(mode="determinate")
+        self.progress_bar.set(0)
+        self.url_entry.configure(state="normal")
+        self.fetch_button.configure(state="normal")
+        self.download_button.configure(state="normal")
+        self.browse_button.configure(state="normal")
+        self.cancel_button.configure(state="disabled")
+        for btn in (self.select_all_btn, self.select_none_btn, self.invert_sel_btn,
+                    self.download_selected_btn):
+            btn.configure(state="normal")
+        if self._fetched_count == 0:
+            self.selection_frame.grid_remove()
+            self._selection_mode = False
+        else:
+            self.selection_summary_label.configure(
+                text=f"{sum(1 for v in self._track_vars if v.get())} of {self._fetched_count} selected"
+            )
+
     def _set_downloading_state(self, downloading: bool) -> None:
         self._is_downloading = downloading
         if downloading:
             self.download_button.configure(state="disabled")
+            self.fetch_button.configure(state="disabled")
             self.cancel_button.configure(state="normal")
             self.browse_button.configure(state="disabled")
             self.url_entry.configure(state="disabled")
+            for btn in (self.select_all_btn, self.select_none_btn, self.invert_sel_btn,
+                        self.download_selected_btn):
+                btn.configure(state="disabled")
             self.status_bar.configure(text="Downloading...")
         else:
             self.download_button.configure(state="normal")
+            self.fetch_button.configure(state="normal")
             self.cancel_button.configure(state="disabled")
             self.browse_button.configure(state="normal")
             self.url_entry.configure(state="normal")
+            for btn in (self.select_all_btn, self.select_none_btn, self.invert_sel_btn,
+                        self.download_selected_btn):
+                btn.configure(state="normal")
             self.progress_bar.set(0)
             self.progress_percent_label.configure(text="0%")
             self.song_counter_label.configure(text="Ready")
@@ -714,10 +867,118 @@ class MainWindow(ctk.CTk):
             self._fallback_active = False
             self.status_bar.configure(text="Ready")
 
+    @staticmethod
+    def _truncate(text: str, max_len: int) -> str:
+        return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+    def _add_track_row(self, track: Dict[str, Any]) -> None:
+        var = ctk.BooleanVar(master=self, value=True)
+        label = f"{track.get('artist') or 'Unknown'} - {track.get('title') or 'Unknown'}"
+        label = self._truncate(label, 72)
+        album = track.get("album")
+        if album:
+            label += f"  [{self._truncate(album, 30)}]"
+        cb = ctk.CTkCheckBox(
+            self.track_scroll,
+            text=label,
+            variable=var,
+            command=self._update_select_count,
+            font=ctk.CTkFont(size=11),
+            checkbox_width=18,
+            checkbox_height=18,
+        )
+        cb.grid(row=self._fetched_count, column=0, padx=8, pady=2, sticky="w")
+        self._track_vars.append(var)
+        self._track_texts.append(track.get("url", ""))
+        self._fetched_count += 1
+        self._update_select_count()
+
+    def _update_select_count(self) -> None:
+        selected = sum(1 for v in self._track_vars if v.get())
+        self.selection_summary_label.configure(
+            text=f"{selected} of {self._fetched_count} selected"
+        )
+
+    def _set_all_tracks(self, value: bool) -> None:
+        for v in self._track_vars:
+            v.set(value)
+        self._update_select_count()
+
+    def _invert_tracks(self) -> None:
+        for v in self._track_vars:
+            v.set(not v.get())
+        self._update_select_count()
+
+    def _reset_selection_panel(self) -> None:
+        for cb in self.track_scroll.winfo_children():
+            cb.destroy()
+        self._track_vars = []
+        self._track_texts = []
+        self._fetched_count = 0
+        self._update_select_count()
+
+    def _start_fetch(self) -> None:
+        if self._is_fetching:
+            return
+        url = self.url_entry.get().strip()
+        if not url:
+            self._log("Error: Please enter a URL to fetch tracks from", status="error")
+            return
+        if self.spotdl_manager.is_running():
+            self._log("Error: Another operation is in progress", status="error")
+            return
+        self._reset_selection_panel()
+        self._is_fetching = True
+        self._fetch_warnings = 0
+        self._selection_mode = True
+        self.url_entry.configure(state="disabled")
+        self.fetch_button.configure(state="disabled")
+        self.download_button.configure(state="disabled")
+        self.browse_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+        for btn in (self.select_all_btn, self.select_none_btn, self.invert_sel_btn,
+                    self.download_selected_btn):
+            btn.configure(state="disabled")
+        self.selection_frame.grid()
+        self.track_label.configure(text="Fetching track list...")
+        self.status_bar.configure(text="Fetching metadata...")
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start()
+        self.progress_percent_label.configure(text="")
+        self._log(f"Fetching tracks: {url}", status="info")
+        self.spotdl_manager.set_config_manager(self.config_manager)
+        self.spotdl_manager.fetch_tracks(url=url, callback=self._callback)
+
+    def _download_selected(self) -> None:
+        if self._is_downloading or self._is_fetching:
+            self._log("Error: An operation is already in progress", status="error")
+            return
+        selected = [t for v, t in zip(self._track_vars, self._track_texts) if v.get() and t]
+        if not selected:
+            self._log("Error: No tracks selected", status="error")
+            return
+        output_path = self.config_manager.download_directory
+        self._current_url = " ".join(selected)
+        self._log(f"Downloading {len(selected)} selected track(s)", status="info")
+        self._log(f"Output: {output_path}", status="info")
+        self.track_label.configure(text=f"Downloading {len(selected)} selected track(s)...")
+        self._set_downloading_state(True)
+        self.spotdl_manager.set_config_manager(self.config_manager)
+        self.spotdl_manager.download_track_or_playlist(
+            url=selected,
+            output_path=Path(output_path),
+            extra_args=None,
+            callback=self._callback,
+            respect_selection=True,
+        )
+
     def _start_download(self) -> None:
         url = self.url_entry.get().strip()
         if not url:
             self._log("Error: Please enter a URL", status="error")
+            return
+        if self._selection_mode and self._fetched_count > 0:
+            self._download_selected()
             return
         if self.spotdl_manager.is_running():
             self._log("Error: Download already in progress", status="error")
@@ -739,6 +1000,13 @@ class MainWindow(ctk.CTk):
         )
 
     def _cancel_download(self) -> None:
+        if self._is_fetching:
+            self.spotdl_manager.cancel_download()
+            self._end_fetch()
+            self._log("Fetch cancelled by user", status="warning")
+            self.track_label.configure(text="Fetch Cancelled")
+            self.status_bar.configure(text="Fetch cancelled")
+            return
         self.spotdl_manager.cancel_download()
         self._log("Download cancelled by user", status="warning")
         self.track_label.configure(text="Download Cancelled")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import platform
 import re
 import subprocess
@@ -10,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from app.core.config import ConfigManager
+
+logger = logging.getLogger(__name__)
 
 try:
     from app.core.config import ConfigManager as _ConfigManagerImpl
@@ -27,6 +31,75 @@ def _get_creationflags() -> int:
     if platform.system() == "Windows":
         return subprocess.CREATE_NO_WINDOW
     return 0
+
+
+FETCH_CHILD_SCRIPT = r"""
+import json, sys, logging
+
+def _emit(obj):
+    try:
+        sys.stdout.write(obj)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+def _safe_json(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return json.dumps(str(obj), ensure_ascii=True)
+
+class _ProtocolHandler(logging.Handler):
+    # Forward WARNING+ log records as __WARN__ protocol lines.
+    def emit(self, record):
+        try:
+            if record.levelno < logging.WARNING:
+                return
+            msg = record.getMessage()
+        except Exception:
+            msg = getattr(record, "msg", "?")
+        _emit("__WARN__" + _safe_json(str(msg)[:300]) + "\n")
+
+# Keep INFO chatter out of the protocol stream, but never lose a
+# warning/error: an unreported partial result looks like a clean fetch.
+_handler = _ProtocolHandler()
+_handler.setLevel(logging.WARNING)
+logging.basicConfig(level=logging.WARNING, handlers=[_handler], force=True)
+
+try:
+    from spotdl.utils.spotify import SpotifyClient
+    SpotifyClient.init(client_id=None, client_secret=None, user_auth=False,
+                       no_cache=True, headless=True)
+except Exception as exc:
+    _emit("__ERR__" + _safe_json("Spotify client init failed: %s" % exc) + "\n")
+    sys.exit(1)
+
+from spotdl.utils.search import parse_query
+
+queries = sys.argv[1:]
+songs = []
+failed_queries = []
+for q in queries:
+    try:
+        songs.extend(parse_query(query=[q], threads=8))
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        failed_queries.append(q)
+        _emit("__WARN__" + _safe_json("Query failed: %s (%s)" % (q[:60], exc)) + "\n")
+
+for s in songs:
+    payload = {
+        "url": getattr(s, "url", "") or "",
+        "artist": getattr(s, "artist", "") or "",
+        "title": getattr(s, "name", "") or "",
+        "album": getattr(s, "album_name", "") or "",
+        "duration": getattr(s, "duration", 0) or 0,
+    }
+    _emit("__TRACK__" + _safe_json(payload) + "\n")
+_emit("__DONE__" + json.dumps({"count": len(songs), "errors": len(failed_queries)}) + "\n")
+sys.exit(1 if (failed_queries and not songs) else 0)
+"""
 
 
 class SpotDLManager:
@@ -119,8 +192,40 @@ class SpotDLManager:
             return {"status": "downloading", "message": clean_line, "percent": percent,
                     "songs_done": done, "songs_total": total}
 
-        percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', clean_line)
+        percent_match = re.search(r'(\d+(?:\.\d+)?)%', clean_line)
         percent = float(percent_match.group(1)) if percent_match else None
+
+        # Fetch-mode protocol lines: __TRACK__{json}, __WARN__{msg},
+        # __DONE__{json}, __ERR__{msg}
+        if clean_line.startswith("__TRACK__"):
+            try:
+                payload = json.loads(clean_line[len("__TRACK__"):])
+                return {"status": "fetched", "track": payload}
+            except ValueError:
+                return {"status": "fetch_error", "message": f"Unparseable track payload: {clean_line[:120]}"}
+        if clean_line.startswith("__WARN__"):
+            try:
+                message = json.loads(clean_line[len("__WARN__"):])
+            except ValueError:
+                message = clean_line[len("__WARN__"):][:200]
+            return {"status": "downloading", "message": str(message), "percent": None, "warning": True}
+        if clean_line.startswith("__DONE__"):
+            try:
+                data = json.loads(clean_line[len("__DONE__"):])
+                count = int(data.get("count", 0))
+                errors = int(data.get("errors", 0))
+            except (ValueError, AttributeError, TypeError):
+                return {"status": "fetch_error", "message": "Malformed fetch completion line"}
+            message = f"Fetched {count} track(s)"
+            if errors:
+                message += f", {errors} query(ies) failed"
+            return {"status": "completed", "message": message, "percent": None,
+                    "songs_total": count, "errors": errors, "partial": errors > 0}
+        if clean_line.startswith("__ERR__"):
+            try:
+                return {"status": "fetch_error", "message": json.loads(clean_line[len("__ERR__"):])}
+            except ValueError:
+                return {"status": "fetch_error", "message": clean_line[len("__ERR__"):][:200]}
 
         if clean_line.startswith('Downloaded "'):
             return {"status": "downloading", "message": clean_line, "percent": percent, "success": True}
@@ -286,30 +391,119 @@ class SpotDLManager:
                 if cancelled:
                     break
                 if callback:
-                    try:
-                        callback({
-                            "status": "downloading",
-                            "message": "[FALLBACK] Primary audio provider failed. Retrying with YouTube provider...",
-                            "percent": None,
-                            "fallback": True,
-                        })
-                    except Exception:
-                        pass
-                current_cmd = self._force_youtube_provider(current_cmd)
-        except Exception as e:
-            if callback:
-                try:
-                    callback({
-                        "status": "error",
-                        "message": f"{error_message}: {e}",
+                    self._emit_status(callback, {
+                        "status": "downloading",
+                        "message": "[FALLBACK] Primary audio provider failed. Retrying with YouTube provider...",
                         "percent": None,
+                        "fallback": True,
                     })
-                except Exception:
-                    pass
+                current_cmd = self._force_youtube_provider(current_cmd)
+        except OSError as e:
+            self._emit_status(callback, {
+                "status": "error",
+                "message": f"{error_message}: {e}",
+                "percent": None,
+            })
+        except Exception as e:
+            logger.exception("spotDL command chain crashed")
+            self._emit_status(callback, {
+                "status": "error",
+                "message": f"{error_message}: {e}",
+                "percent": None,
+            })
         finally:
             # Reset state only after the active process (and any retry) finished
             self._reset_run_state()
     
+    def _emit_status(
+        self,
+        callback: Optional[Callable[[Dict[str, Any]], None]],
+        status: Dict[str, Any],
+    ) -> None:
+        """Deliver a status to the callback; a failing callback must not kill
+        the worker thread, but the failure is logged and surfaced as a warning."""
+        if callback is None:
+            return
+        try:
+            callback(status)
+        except Exception:
+            logger.exception("status callback raised; delivery may be lost")
+            try:
+                callback({
+                    "status": "downloading",
+                    "message": "UI status callback failed for: %s" % status.get("message", "?"),
+                    "percent": None,
+                    "warning": True,
+                })
+            except Exception:
+                logger.exception("status callback failed again; dropping status")
+
+    def _stream_output_lines(
+        self,
+        process: subprocess.Popen[bytes],
+        callback: Optional[Callable[[Dict[str, Any]], None]],
+        status_from_line: Callable[[str], Optional[Dict[str, Any]]],
+    ) -> None:
+        """Read stdout (then stderr) line by line, forwarding mapped statuses."""
+        for pipe in (process.stdout, process.stderr):
+            if pipe is None:
+                continue
+            with self._lock:
+                cancelled = self._cancelled
+            if cancelled:
+                break
+            try:
+                for line in iter(pipe.readline, b''):
+                    with self._lock:
+                        if self._cancelled:
+                            break
+                    decoded = line.decode('utf-8', errors='replace')
+                    status = status_from_line(decoded)
+                    if status is None:
+                        continue
+                    self._emit_status(callback, status)
+            except OSError as e:
+                self._emit_status(callback, {
+                    "status": "downloading",
+                    "message": f"Pipe read error during fetch: {e}",
+                    "percent": None,
+                    "warning": True,
+                })
+        with self._lock:
+            cancelled = self._cancelled
+        if cancelled:
+            self._stop_process(process)
+        else:
+            try:
+                process.wait()
+            except Exception:
+                pass
+
+    def _read_pipe_stream(
+        self,
+        pipe,
+        callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Optional[Dict[str, Any]]:
+        """Read one pipe line by line, emitting parsed statuses.
+        Returns the status that requested a provider fallback, else None."""
+        try:
+            for line in iter(pipe.readline, b''):
+                with self._lock:
+                    if self._cancelled:
+                        break
+                status = self._parse_log_line(line.decode('utf-8', errors='replace'))
+                if self._try_fallback(status):
+                    return status
+                self._emit_status(callback, status)
+        except OSError as e:
+            self._emit_status(callback, {
+                "status": "downloading",
+                "message": f"Pipe read error: {e}",
+                "percent": None,
+                "warning": True,
+            })
+        return None
+
     def _stream_output(self, process: subprocess.Popen[bytes], callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> bool:
         """Stream output from a process, calling callback for each parsed line.
 
@@ -318,45 +512,11 @@ class SpotDLManager:
         process and relaunching with the fallback command.
         """
         if process.stdout:
-            try:
-                for line in iter(process.stdout.readline, b''):
-                    with self._lock:
-                        if self._cancelled:
-                            break
-                    try:
-                        decoded = line.decode('utf-8', errors='replace')
-                    except Exception:
-                        continue
-                    status = self._parse_log_line(decoded)
-                    if self._try_fallback(status):
-                        return True
-                    if callback:
-                        try:
-                            callback(status)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            if self._read_pipe_stream(process.stdout, callback) is not None:
+                return True
         if process.stderr and not self._cancelled:
-            try:
-                for line in iter(process.stderr.readline, b''):
-                    with self._lock:
-                        if self._cancelled:
-                            break
-                    try:
-                        decoded = line.decode('utf-8', errors='replace')
-                    except Exception:
-                        continue
-                    status = self._parse_log_line(decoded)
-                    if self._try_fallback(status):
-                        return True
-                    if callback:
-                        try:
-                            callback(status)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            if self._read_pipe_stream(process.stderr, callback) is not None:
+                return True
         with self._lock:
             cancelled = self._cancelled
         if cancelled:
@@ -371,36 +531,33 @@ class SpotDLManager:
 
         # spotdl prints no overall completion line; report the process exit
         # so the UI can leave the "downloading" state.
-        if callback:
-            try:
-                with self._lock:
-                    cancelled = self._cancelled
-                if not cancelled:
-                    returncode = process.returncode
-                    if returncode == 0:
-                        callback({
-                            "status": "completed",
-                            "message": "Download finished",
-                            "percent": 100.0,
-                        })
-                    else:
-                        callback({
-                            "status": "error",
-                            "message": f"spotDL exited with code {returncode}",
-                            "percent": None,
-                            "type": "ProcessError",
-                        })
-            except Exception:
-                pass
-    
-    def _build_base_extra_args(self, cfg: Dict[str, Any]) -> List[str]:
+        with self._lock:
+            cancelled = self._cancelled
+        if not cancelled:
+            returncode = process.returncode
+            if returncode == 0:
+                self._emit_status(callback, {
+                    "status": "completed",
+                    "message": "Download finished",
+                    "percent": 100.0,
+                })
+            else:
+                self._emit_status(callback, {
+                    "status": "error",
+                    "message": f"spotDL exited with code {returncode}",
+                    "percent": None,
+                    "type": "ProcessError",
+                })
+
+    def _build_base_extra_args(self, cfg: Dict[str, Any], fetch_albums: Optional[bool] = None) -> List[str]:
         extra: List[str] = []
         # simple-tui emits plain line-based output; the rich progress bar
         # prints nothing when stdout is a pipe, leaving the UI without signal
         extra.append("--simple-tui")
         bitrate = cfg.get("bitrate", "320k")
         audio_format = cfg.get("format", "mp3")
-        fetch_albums = cfg.get("fetch_albums", True)
+        if fetch_albums is None:
+            fetch_albums = cfg.get("fetch_albums", True)
         overwrite = cfg.get("overwrite_mode", "skip")
         extra.extend(["--bitrate", str(bitrate)])
         extra.extend(["--format", str(audio_format)])
@@ -421,25 +578,31 @@ class SpotDLManager:
     
     def download_track_or_playlist(
         self,
-        url: str,
+        url: "str | list[str]",
         output_path: Path,
         extra_args: Optional[List[str]] = None,
         callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         config_manager: Optional["ConfigManager"] = None,
+        respect_selection: bool = False,
     ) -> None:
+        """Download one or many tracks/playlists. `url` may be a single query
+        string or a list of queries (e.g. selected track URLs).
+        With respect_selection=True the album-expansion setting is ignored so
+        each selected track downloads exactly itself."""
         self.cancel_download()
         # Wait for previous threads to fully terminate
         self._wait_for_streaming_threads(timeout=5)
+        url_list = [str(u) for u in url] if isinstance(url, (list, tuple)) else [url]
         with self._lock:
             if config_manager is not None:
                 self._config_manager = config_manager
             elif self._config_manager is None and _ConfigManagerImpl is not None:
                 try:
                     self._config_manager = _ConfigManagerImpl()
-                except Exception:
-                    pass
+                except (OSError, ValueError):
+                    logger.exception("could not create fallback ConfigManager")
             cfg = self._get_config()
-            self._current_url = url
+            self._current_url = " ".join(url_list)
             self._current_output_path = Path(output_path)
             self._current_callback = callback
             self._fallback_attempts = 0
@@ -450,7 +613,9 @@ class SpotDLManager:
             if not has_audio:
                 cmd_extra.extend(["--audio", provider])
             # Build base args from config
-            base_extra = self._build_base_extra_args(cfg)
+            base_extra = self._build_base_extra_args(
+                cfg, fetch_albums=False if respect_selection else None
+            )
             # Merge with no duplicates: base first, then user extras
             final_extra = self._merge_args_no_duplicates(base_extra, cmd_extra)
             output_template = cfg.get(
@@ -460,7 +625,10 @@ class SpotDLManager:
                 sys.executable,
                 "-m",
                 "spotdl",
-                url,
+                # explicit subcommand: this build treats the first positional
+                # as the operation, so extra query URLs would be rejected
+                "download",
+                *url_list,
                 "--output",
                 str(self._current_output_path / output_template),
             ]
@@ -471,6 +639,87 @@ class SpotDLManager:
             args=(cmd, callback, "Failed to start spotDL"),
             daemon=True,
         )
+        self._thread.start()
+
+    def fetch_tracks(
+        self,
+        url: "str | list[str]",
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        """Fetch Spotify track metadata (no audio search) and stream tracks
+        back via callback as {"status": "fetched", "track": {...}} events.
+
+        Runs spotdl's metadata pipeline in a child process so it never blocks
+        or interferes with the GUI thread. Emits a "fetch_error" event on
+        failure and a "completed" event with songs_total on success.
+        """
+        self.cancel_download()
+        self._wait_for_streaming_threads(timeout=5)
+        with self._lock:
+            self._cancelled = False
+            self._current_url = url
+            self._current_callback = callback
+
+        def _run():
+            url_list = [str(u) for u in url] if isinstance(url, (list, tuple)) else [url]
+            cmd = [sys.executable, "-c", FETCH_CHILD_SCRIPT, *url_list]
+            try:
+                with self._lock:
+                    self._streaming_threads.append(threading.current_thread())
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=_get_creationflags(),
+                )
+                with self._lock:
+                    self._process = process
+                    cancelled = self._cancelled
+                if cancelled:
+                    self._stop_process(process)
+                    return
+                error_seen = [False]
+                done_seen = [False]
+
+                def _status(line: str) -> Optional[Dict[str, Any]]:
+                    # stdout and stderr are merged; only protocol lines matter
+                    clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line).strip()
+                    if not clean.startswith(("__TRACK__", "__DONE__", "__ERR__", "__WARN__")):
+                        return None
+                    status = self._parse_log_line(clean)
+                    kind = status.get("status")
+                    if kind == "fetch_error":
+                        error_seen[0] = True
+                    elif kind == "completed" and status.get("songs_total") is not None:
+                        done_seen[0] = True
+                    return status
+
+                self._stream_output_lines(process, callback, _status)
+                with self._lock:
+                    cancelled = self._cancelled
+                if cancelled or error_seen[0] or done_seen[0]:
+                    return
+                returncode = process.returncode
+                if callback:
+                    if returncode == 0:
+                        # Child ended without a completion line (e.g. empty list)
+                        callback({"status": "completed", "message": "Fetch finished",
+                                 "percent": None, "songs_total": 0})
+                    else:
+                        callback({
+                            "status": "fetch_error",
+                            "message": f"Track fetch exited with code {returncode}",
+                        })
+            except Exception as e:
+                if callback:
+                    try:
+                        callback({"status": "fetch_error", "message": f"Failed to start track fetch: {e}"})
+                    except Exception:
+                        pass
+            finally:
+                self._reset_run_state()
+
+        self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
     
     def sync_playlist(
