@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List, Optional
 
 import customtkinter as ctk
 from tkinter import filedialog
@@ -14,9 +16,11 @@ from app.core.config import ConfigManager
 from app.core.spotdl_wrapper import SpotDLManager
 from app.utils import system_check
 
+logger = logging.getLogger(__name__)
 
 # Glassmorphism color palette (using CTK-compatible tuple colors for light/dark modes)
-# These create a frosted glass effect - semi-transparent through CTK's rendering
+# Format: (light_color, dark_color)
+WINDOW_BG = ("#f1f5f9", "#0f172a")
 
 # Glass frame backgrounds - frosted semi-transparent look
 GLASS_FRAME_BG = ("#e8f0fe", "#1e293b")  # Light frosted / dark slate
@@ -33,14 +37,12 @@ ACCENT_RED = "#e74c3c"
 ACCENT_GREEN = "#2ecc71"
 ACCENT_ORANGE = "#f39c12"
 
-# Glassmorphism font colors
-TEXT_PRIMARY_LIGHT = "#1a1a1a"
-TEXT_SECONDARY_LIGHT = "#555555"
-TEXT_PRIMARY_DARK = "#e8e8e8"
-TEXT_SECONDARY_DARK = "#aaaaaa"
+# Typography colors (light mode, dark mode)
+TEXT_PRIMARY = ("#1a1a1a", "#e8e8e8")
+TEXT_SECONDARY = ("#555555", "#aaaaaa")
 
 # Log colors
-LOG_TEXT_NORMAL = "#d4d4d4"
+LOG_TEXT_NORMAL = ("#333333", "#d4d4d4")
 LOG_TEXT_ERROR = "#ff6b6b"
 LOG_TEXT_WARNING = "#f39c12"
 LOG_TEXT_SUCCESS = "#2ecc71"
@@ -49,7 +51,7 @@ LOG_TEXT_INFO = "#4fc3f7"
 
 
 class GlassFrame(ctk.CTkFrame):
-    """A frame with glassmorphism styling."""
+    """A frame with glassmorphism styling supporting light and dark modes."""
 
     def __init__(self, master: Any, corner_radius: int = 15, border_width: int = 1, **kwargs: Any) -> None:
         super().__init__(
@@ -58,28 +60,26 @@ class GlassFrame(ctk.CTkFrame):
             border_width=border_width,
             fg_color=GLASS_FRAME_BG,
             border_color=GLASS_FRAME_BORDER,
-            **kwargs
+            **kwargs,
         )
 
 
 class GlassButton(ctk.CTkButton):
-    """A button with glassmorphism styling."""
+    """A button with glassmorphism styling supporting light and dark modes."""
 
     def __init__(self, master: Any, **kwargs: Any) -> None:
-        # Default glass styles
         kwargs.setdefault("corner_radius", 12)
         kwargs.setdefault("border_width", 1)
         kwargs.setdefault("border_color", GLASS_FRAME_BORDER)
         kwargs.setdefault("height", 36)
-        # Remove text_color from kwargs if provided, we'll set our own
         kwargs.setdefault("fg_color", GLASS_BTN_BG)
         kwargs.setdefault("hover_color", GLASS_BTN_HOVER)
-        text_color = kwargs.pop("text_color", TEXT_PRIMARY_DARK)
-        super().__init__(master, text_color=text_color, **kwargs)
+        kwargs.setdefault("text_color", TEXT_PRIMARY)
+        super().__init__(master, **kwargs)
 
 
 class GlassEntry(ctk.CTkEntry):
-    """An entry widget with glassmorphism styling."""
+    """An entry widget with glassmorphism styling supporting light and dark modes."""
 
     def __init__(self, master: Any, **kwargs: Any) -> None:
         kwargs.setdefault("corner_radius", 12)
@@ -87,8 +87,8 @@ class GlassEntry(ctk.CTkEntry):
         kwargs.setdefault("height", 36)
         kwargs.setdefault("fg_color", GLASS_FRAME_BG)
         kwargs.setdefault("border_color", GLASS_FRAME_BORDER)
-        kwargs.setdefault("text_color", TEXT_PRIMARY_DARK)
-        kwargs.setdefault("placeholder_text_color", TEXT_SECONDARY_DARK)
+        kwargs.setdefault("text_color", TEXT_PRIMARY)
+        kwargs.setdefault("placeholder_text_color", TEXT_SECONDARY)
         super().__init__(master, **kwargs)
 
 
@@ -97,8 +97,8 @@ class MainWindow(ctk.CTk):
     Main application window for the MusicPlayer (spotDL) GUI.
 
     Provides URL input, output directory selection, download control,
-    progress display, cancellation, live log streaming, settings modal,
-    and system repair quick-fixes.
+    progress display with speed/ETA, cancellation, live log streaming,
+    track search/filtering, settings modal, and system repair quick-fixes.
     """
 
     def __init__(self) -> None:
@@ -107,12 +107,10 @@ class MainWindow(ctk.CTk):
         self.geometry("1000x720")
         self.minsize(900, 650)
 
-        # Apply Modern Theme with glassmorphism
+        # Apply Modern Theme with glassmorphism (improvement 5.1)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-
-        # Set custom background
-        self.configure(background="#0f172a")
+        self.configure(fg_color=WINDOW_BG)
 
         self.config_manager = ConfigManager()
         self.spotdl_manager = SpotDLManager(self.config_manager)
@@ -121,14 +119,23 @@ class MainWindow(ctk.CTk):
         self._is_downloading = False
         self._current_url = ""
         self._fallback_active = False
+
+        # Session tracking state (improvement 1.2 & 5.3)
         self._session_start = time.time()
         self._session_files = 0
         self._session_bytes = 0
+        self._tracked_session_files: set[str] = set()
+        self._last_speed_time = time.time()
+        self._last_speed_bytes = 0
+        self._current_speed_bps = 0.0
 
-        # Track-selection state
+        # Track-selection and batch rendering state (improvement 1.3 & 5.2)
         self._fetched_count = 0
-        self._track_vars: list = []
-        self._track_texts: list = []
+        self._track_vars: List[ctk.BooleanVar] = []
+        self._track_texts: List[str] = []
+        self._track_checkboxes: List[ctk.CTkCheckBox] = []
+        self._pending_tracks: List[Dict[str, Any]] = []
+        self._batch_render_id: Optional[str] = None
         self._is_fetching = False
         self._selection_mode = False
         self._fetch_warnings = 0
@@ -151,10 +158,16 @@ class MainWindow(ctk.CTk):
         self._build_log_section()
         self._build_status_bar()
 
+        # Keyboard shortcuts (improvement 5.4)
+        self.bind("<Control-v>", self._paste_and_focus)
+        self.bind("<Escape>", lambda e: self._cancel_download())
+        self.bind("<Control-l>", lambda e: self._clear_log())
+        self.bind("<Control-s>", lambda e: self._open_settings())
+
         self._update_system_status()
 
     def _build_header(self) -> None:
-        """Build the header section with title and system controls."""
+        """Build the header section with title, theme toggle, and system controls."""
         self.header_frame = GlassFrame(self.main_container, corner_radius=20)
         self.header_frame.grid(row=0, column=0, pady=(0, 10), sticky="ew")
         self.header_frame.grid_columnconfigure(1, weight=1)
@@ -163,7 +176,7 @@ class MainWindow(ctk.CTk):
             self.header_frame,
             text="MusicPlayer",
             font=ctk.CTkFont(size=24, weight="bold"),
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
         self.title_label.grid(row=0, column=0, padx=15, pady=(12, 0), sticky="sw")
 
@@ -171,7 +184,7 @@ class MainWindow(ctk.CTk):
             self.header_frame,
             text="Spotify Downloader",
             font=ctk.CTkFont(size=12),
-            text_color=TEXT_SECONDARY_DARK,
+            text_color=TEXT_SECONDARY,
         )
         self.subtitle_label.grid(row=1, column=0, padx=15, pady=(0, 12), sticky="nw")
 
@@ -180,9 +193,20 @@ class MainWindow(ctk.CTk):
             text="",
             font=ctk.CTkFont(size=10),
             anchor="w",
-            text_color=TEXT_SECONDARY_DARK,
+            text_color=TEXT_SECONDARY,
         )
         self.status_label.grid(row=0, column=1, rowspan=2, padx=15, pady=8, sticky="ew")
+
+        # Theme toggle button (improvement 5.5)
+        self.theme_toggle = GlassButton(
+            self.header_frame,
+            text="☀️",
+            width=38,
+            height=28,
+            font=ctk.CTkFont(size=13),
+            command=self._toggle_theme,
+        )
+        self.theme_toggle.grid(row=0, column=2, rowspan=2, padx=4, pady=8, sticky="ns")
 
         self.ffmpeg_fix_btn = GlassButton(
             self.header_frame,
@@ -192,7 +216,7 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=10),
             command=self._install_ffmpeg,
         )
-        self.ffmpeg_fix_btn.grid(row=0, column=2, rowspan=2, padx=5, pady=8, sticky="ns")
+        self.ffmpeg_fix_btn.grid(row=0, column=3, rowspan=2, padx=4, pady=8, sticky="ns")
 
         self.deno_fix_btn = GlassButton(
             self.header_frame,
@@ -202,17 +226,44 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=10),
             command=self._install_deno,
         )
-        self.deno_fix_btn.grid(row=0, column=3, rowspan=2, padx=5, pady=8, sticky="ns")
+        self.deno_fix_btn.grid(row=0, column=4, rowspan=2, padx=4, pady=8, sticky="ns")
 
         self.settings_button = GlassButton(
             self.header_frame,
             text="Settings",
-            width=110,
+            width=100,
             height=28,
             font=ctk.CTkFont(size=10),
             command=self._open_settings,
         )
-        self.settings_button.grid(row=0, column=4, rowspan=2, padx=(5, 15), pady=8, sticky="ns")
+        self.settings_button.grid(row=0, column=5, rowspan=2, padx=(4, 15), pady=8, sticky="ns")
+
+    def _toggle_theme(self) -> None:
+        """Toggle between Dark and Light appearance modes (improvement 5.5)."""
+        current = ctk.get_appearance_mode().lower()
+        if current == "dark":
+            ctk.set_appearance_mode("light")
+            self.theme_toggle.configure(text="🌙")
+            self._log("Switched to Light mode", status="info")
+        else:
+            ctk.set_appearance_mode("dark")
+            self.theme_toggle.configure(text="☀️")
+            self._log("Switched to Dark mode", status="info")
+
+    def _paste_and_focus(self, event: Optional[Any] = None) -> None:
+        """Paste URL from clipboard and focus URL input (improvement 5.4)."""
+        try:
+            focused = self.focus_get()
+            # If user is in another text input, don't overwrite
+            if focused is not None and focused != self.url_entry and isinstance(focused, (ctk.CTkEntry, ctk.CTkTextbox)):
+                return
+            clipboard = self.clipboard_get().strip()
+            if clipboard:
+                self.url_entry.delete(0, "end")
+                self.url_entry.insert(0, clipboard)
+                self.url_entry.focus_set()
+        except Exception:
+            pass
 
     def _build_download_section(self) -> None:
         """Build the URL input, download control, and output directory section."""
@@ -225,13 +276,13 @@ class MainWindow(ctk.CTk):
             text="Spotify URL or Track Link",
             font=ctk.CTkFont(size=11, weight="bold"),
             anchor="w",
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
         self.url_label.grid(row=0, column=0, padx=15, pady=(10, 2), sticky="w")
 
         self.url_entry = GlassEntry(
             self.download_frame,
-            placeholder_text="Enter Spotify track, album, or playlist URL...",
+            placeholder_text="Enter Spotify track, album, or playlist URL (Ctrl+V)...",
             height=40,
             font=ctk.CTkFont(size=12),
         )
@@ -270,7 +321,7 @@ class MainWindow(ctk.CTk):
             text=f"Output Directory: {self.config_manager.download_directory}",
             anchor="w",
             font=ctk.CTkFont(size=10),
-            text_color=TEXT_SECONDARY_DARK,
+            text_color=TEXT_SECONDARY,
         )
         self.output_label.grid(row=2, column=0, columnspan=2, padx=15, pady=(0, 10), sticky="ew")
 
@@ -285,18 +336,18 @@ class MainWindow(ctk.CTk):
         self.browse_button.grid(row=2, column=2, padx=(0, 15), pady=(0, 10), sticky="e")
 
     def _build_selection_section(self) -> None:
-        """Build the track selection panel (hidden until tracks are fetched)."""
+        """Build the track selection panel with search filter (improvement 5.2)."""
         self.selection_frame = GlassFrame(self.main_container, corner_radius=20)
         self.selection_frame.grid(row=2, column=0, pady=(0, 10), sticky="nsew")
         self.selection_frame.grid_columnconfigure(0, weight=1)
-        self.selection_frame.grid_rowconfigure(2, weight=1)
+        self.selection_frame.grid_rowconfigure(3, weight=1)
 
         self.selection_header = ctk.CTkLabel(
             self.selection_frame,
             text="Select Tracks",
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w",
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
         self.selection_header.grid(row=0, column=0, padx=15, pady=(10, 2), sticky="w")
 
@@ -305,47 +356,70 @@ class MainWindow(ctk.CTk):
             text="0 of 0 selected",
             font=ctk.CTkFont(size=10),
             anchor="w",
-            text_color=TEXT_SECONDARY_DARK,
+            text_color=TEXT_SECONDARY,
         )
-        self.selection_summary_label.grid(row=1, column=0, padx=15, pady=(0, 5), sticky="w")
+        self.selection_summary_label.grid(row=1, column=0, padx=15, pady=(0, 4), sticky="w")
 
         # Toolbar with selection and download actions
         toolbar = ctk.CTkFrame(self.selection_frame, fg_color="transparent")
-        toolbar.grid(row=0, column=1, rowspan=2, padx=(0, 15), pady=(10, 5), sticky="ne")
+        toolbar.grid(row=0, column=1, rowspan=2, padx=(0, 15), pady=(10, 4), sticky="ne")
         self.select_all_btn = GlassButton(
-            toolbar, text="Select All", width=90, height=26,
+            toolbar, text="Select All", width=85, height=26,
             font=ctk.CTkFont(size=10), command=lambda: self._set_all_tracks(True),
         )
-        self.select_all_btn.grid(row=0, column=0, padx=4)
+        self.select_all_btn.grid(row=0, column=0, padx=3)
         self.select_none_btn = GlassButton(
-            toolbar, text="Select None", width=90, height=26,
+            toolbar, text="Select None", width=85, height=26,
             font=ctk.CTkFont(size=10), command=lambda: self._set_all_tracks(False),
         )
-        self.select_none_btn.grid(row=0, column=1, padx=4)
+        self.select_none_btn.grid(row=0, column=1, padx=3)
         self.invert_sel_btn = GlassButton(
-            toolbar, text="Invert", width=70, height=26,
+            toolbar, text="Invert", width=65, height=26,
             font=ctk.CTkFont(size=10), command=self._invert_tracks,
         )
-        self.invert_sel_btn.grid(row=0, column=2, padx=4)
+        self.invert_sel_btn.grid(row=0, column=2, padx=3)
         self.download_selected_btn = ctk.CTkButton(
-            toolbar, text="Download Selected", width=150, height=28,
+            toolbar, text="Download Selected", width=140, height=28,
             corner_radius=12, font=ctk.CTkFont(size=11, weight="bold"),
             fg_color=ACCENT_BLUE, hover_color=CTA_HOVER,
             command=self._download_selected,
         )
-        self.download_selected_btn.grid(row=1, column=0, columnspan=3, padx=4, pady=(6, 0))
+        self.download_selected_btn.grid(row=1, column=0, columnspan=3, padx=3, pady=(5, 0))
+
+        # Search & Filter bar (improvement 5.2)
+        self.track_search_entry = GlassEntry(
+            self.selection_frame,
+            placeholder_text="Filter tracks by title, artist, or album...",
+            height=30,
+            font=ctk.CTkFont(size=11),
+        )
+        self.track_search_entry.grid(row=2, column=0, columnspan=2, padx=15, pady=(0, 6), sticky="ew")
+        self.track_search_entry.bind("<KeyRelease>", self._filter_tracks)
 
         # Scrollable checkbox list
         self.track_scroll = ctk.CTkScrollableFrame(
             self.selection_frame, fg_color="transparent", label_text=""
         )
-        self.track_scroll.grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 12), sticky="nsew")
+        self.track_scroll.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 12), sticky="nsew")
         self.track_scroll.grid_columnconfigure(0, weight=1)
 
         self.selection_frame.grid_remove()
 
+    def _filter_tracks(self, event: Optional[Any] = None) -> None:
+        """Filter visible track checkboxes according to search query (improvement 5.2)."""
+        query = self.track_search_entry.get().strip().lower()
+        for cb in self._track_checkboxes:
+            try:
+                text = cb.cget("text").lower()
+                if not query or query in text:
+                    cb.grid()
+                else:
+                    cb.grid_remove()
+            except Exception:
+                pass
+
     def _build_progress_section(self) -> None:
-        """Build the progress bar, song counter, and cancel control section."""
+        """Build progress bar, speed/ETA (improvement 5.3), and cancel button."""
         self.progress_frame = GlassFrame(self.main_container, corner_radius=20)
         self.progress_frame.grid(row=3, column=0, pady=(0, 10), sticky="ew")
         self.progress_frame.grid_columnconfigure(1, weight=1)
@@ -355,9 +429,9 @@ class MainWindow(ctk.CTk):
             text="Ready to download",
             anchor="w",
             font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
-        self.track_label.grid(row=0, column=0, columnspan=3, padx=15, pady=(10, 5), sticky="ew")
+        self.track_label.grid(row=0, column=0, columnspan=3, padx=15, pady=(10, 4), sticky="ew")
 
         self.song_counter_label = ctk.CTkLabel(
             self.progress_frame,
@@ -365,13 +439,13 @@ class MainWindow(ctk.CTk):
             width=90,
             anchor="e",
             font=ctk.CTkFont(size=10),
-            text_color=TEXT_SECONDARY_DARK,
+            text_color=TEXT_SECONDARY,
         )
-        self.song_counter_label.grid(row=1, column=0, padx=15, pady=(0, 10), sticky="e")
+        self.song_counter_label.grid(row=1, column=0, padx=15, pady=(0, 4), sticky="e")
 
         # Progress bar container with percentage
         self.progress_container = ctk.CTkFrame(self.progress_frame, fg_color="transparent")
-        self.progress_container.grid(row=1, column=1, padx=(10, 10), pady=(0, 10), sticky="ew")
+        self.progress_container.grid(row=1, column=1, padx=(10, 10), pady=(0, 4), sticky="ew")
         self.progress_container.grid_columnconfigure(0, weight=1)
 
         self.progress_bar = ctk.CTkProgressBar(
@@ -385,9 +459,32 @@ class MainWindow(ctk.CTk):
             text="0%",
             width=55,
             font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
         self.progress_percent_label.grid(row=0, column=1, sticky="e")
+
+        # Speed and ETA row (improvement 5.3)
+        self.speed_eta_frame = ctk.CTkFrame(self.progress_frame, fg_color="transparent")
+        self.speed_eta_frame.grid(row=2, column=1, padx=(10, 10), pady=(0, 8), sticky="ew")
+        self.speed_eta_frame.grid_columnconfigure(1, weight=1)
+
+        self.speed_label = ctk.CTkLabel(
+            self.speed_eta_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            anchor="w",
+            text_color=TEXT_SECONDARY,
+        )
+        self.speed_label.grid(row=0, column=0, sticky="w")
+
+        self.eta_label = ctk.CTkLabel(
+            self.speed_eta_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            anchor="e",
+            text_color=TEXT_SECONDARY,
+        )
+        self.eta_label.grid(row=0, column=1, sticky="e")
 
         # Fallback badge with glass styling
         self.fallback_badge = ctk.CTkLabel(
@@ -400,13 +497,13 @@ class MainWindow(ctk.CTk):
             width=110,
             height=22,
         )
-        self.fallback_badge.grid(row=1, column=2, padx=(0, 8), pady=(0, 10))
+        self.fallback_badge.grid(row=1, column=2, padx=(0, 8), pady=(0, 4))
         self.fallback_badge.grid_remove()
 
         # Action buttons
         self.cancel_button = GlassButton(
             self.progress_frame,
-            text="Cancel",
+            text="Cancel (Esc)",
             width=110,
             height=36,
             font=ctk.CTkFont(size=10),
@@ -427,14 +524,14 @@ class MainWindow(ctk.CTk):
             text="Download Log",
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w",
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
         self.log_header.grid(row=0, column=0, padx=15, pady=(10, 5), sticky="w")
 
         self.clear_log_button = GlassButton(
             self.log_frame,
-            text="Clear Log",
-            width=90,
+            text="Clear (Ctrl+L)",
+            width=95,
             height=26,
             font=ctk.CTkFont(size=10),
             command=self._clear_log,
@@ -449,10 +546,9 @@ class MainWindow(ctk.CTk):
             border_width=0,
         )
         self.log_textbox.grid(row=1, column=0, padx=15, pady=(0, 15), sticky="nsew")
-        self.log_textbox.configure(state="disabled", text_color=TEXT_PRIMARY_DARK)
-        self._setup_log_tags()  # Initialize log tag colors
+        self.log_textbox.configure(state="disabled", text_color=TEXT_PRIMARY)
+        self._setup_log_tags()
 
-        # Add scrollbar to log textbox
         self.log_scrollbar = ctk.CTkScrollbar(
             self.log_frame,
             command=self.log_textbox.yview,
@@ -472,7 +568,7 @@ class MainWindow(ctk.CTk):
             text="Ready",
             font=ctk.CTkFont(size=10),
             anchor="w",
-            text_color=TEXT_PRIMARY_DARK,
+            text_color=TEXT_PRIMARY,
         )
         self.status_bar.grid(row=0, column=0, padx=12, pady=6, sticky="w")
 
@@ -481,7 +577,7 @@ class MainWindow(ctk.CTk):
             text="Session: 0 files | 0.0 MB",
             font=ctk.CTkFont(size=10),
             anchor="e",
-            text_color=TEXT_SECONDARY_DARK,
+            text_color=TEXT_SECONDARY,
         )
         self.session_stats_label.grid(row=0, column=1, padx=12, pady=6, sticky="e")
 
@@ -489,22 +585,31 @@ class MainWindow(ctk.CTk):
         self.system_status = system_check.check_all()
         ffmpeg_ok = self.system_status.get("ffmpeg", {}).get("available", False)
         deno_ok = self.system_status.get("deno", {}).get("available", False)
+        internet_ok = self.system_status.get("internet", {}).get("available", True)
+
+        status_parts = [
+            f"FFmpeg: {'OK' if ffmpeg_ok else 'MISSING'}",
+            f"Deno: {'OK' if deno_ok else 'MISSING'}",
+        ]
+        if not internet_ok:
+            status_parts.append("Network: OFFLINE")
+
         self.status_label.configure(
-            text=f"FFmpeg: {'OK' if ffmpeg_ok else 'MISSING'} | Deno: {'OK' if deno_ok else 'MISSING'}",
-            text_color=TEXT_SECONDARY_DARK,
+            text=" | ".join(status_parts),
+            text_color=ACCENT_RED if not (ffmpeg_ok and deno_ok and internet_ok) else TEXT_SECONDARY,
         )
         if hasattr(self, "ffmpeg_fix_btn"):
             if ffmpeg_ok:
                 self.ffmpeg_fix_btn.grid_remove()
             else:
                 self.ffmpeg_fix_btn.configure(state="normal")
-                self.ffmpeg_fix_btn.grid(row=0, column=2, rowspan=2, padx=5, pady=8, sticky="ns")
+                self.ffmpeg_fix_btn.grid(row=0, column=3, rowspan=2, padx=4, pady=8, sticky="ns")
         if hasattr(self, "deno_fix_btn"):
             if deno_ok:
                 self.deno_fix_btn.grid_remove()
             else:
                 self.deno_fix_btn.configure(state="normal")
-                self.deno_fix_btn.grid(row=0, column=3, rowspan=2, padx=5, pady=8, sticky="ns")
+                self.deno_fix_btn.grid(row=0, column=4, rowspan=2, padx=4, pady=8, sticky="ns")
 
     def _run_install_thread(self, installer_func: Callable[[], subprocess.Popen[bytes]], name: str) -> None:
         def _run():
@@ -529,16 +634,16 @@ class MainWindow(ctk.CTk):
         self._run_install_thread(system_check.install_deno, "Deno")
 
     def _open_settings(self) -> None:
+        """Open settings dialog supporting all configured options."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Settings")
-        dialog.geometry("620x480")
-        dialog.minsize(560, 420)
+        dialog.geometry("640x520")
+        dialog.minsize(580, 460)
         dialog.transient(self)
-        dialog.configure(background="#0f172a")
+        dialog.configure(fg_color=WINDOW_BG)
         dialog.grid_columnconfigure(0, weight=1)
         dialog.grid_rowconfigure(0, weight=1)
 
-        # Glassmorphism dialog background
         dialog_bg = GlassFrame(dialog, corner_radius=0)
         dialog_bg.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         dialog_bg.grid_columnconfigure(0, weight=1)
@@ -548,71 +653,123 @@ class MainWindow(ctk.CTk):
         tabview.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="nsew")
         tabview.grid_columnconfigure(0, weight=1)
         tabview.add("Quality")
-        tabview.add("Provider")
+        tabview.add("Provider & Network")
         tabview.add("Save Location")
 
-        # Quality tab
+        # Quality tab (improvements 3.1 & 4.2)
         quality_tab = tabview.tab("Quality")
         quality_tab.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(quality_tab, text="Audio Quality", font=ctk.CTkFont(weight="bold"), text_color=TEXT_PRIMARY_DARK).grid(row=0, column=0, columnspan=2, padx=12, pady=(8, 2), sticky="w")
-        ctk.CTkLabel(quality_tab, text="Bitrate:", text_color=TEXT_SECONDARY_DARK).grid(row=1, column=0, padx=12, pady=5, sticky="w")
+
+        ctk.CTkLabel(quality_tab, text="Audio Quality & Encoding", font=ctk.CTkFont(weight="bold"), text_color=TEXT_PRIMARY).grid(row=0, column=0, columnspan=2, padx=12, pady=(8, 4), sticky="w")
+
+        ctk.CTkLabel(quality_tab, text="Bitrate:", text_color=TEXT_SECONDARY).grid(row=1, column=0, padx=12, pady=5, sticky="w")
         bitrate_var = ctk.StringVar(value=self.config_manager.bitrate)
         bitrate_menu = ctk.CTkOptionMenu(quality_tab, variable=bitrate_var, values=["320k", "256k", "192k", "128k"])
         bitrate_menu.grid(row=1, column=1, padx=12, pady=5, sticky="ew")
-        ctk.CTkLabel(quality_tab, text="Audio Format:", text_color=TEXT_SECONDARY_DARK).grid(row=2, column=0, padx=12, pady=5, sticky="w")
-        format_var = ctk.StringVar(value=self.config_manager.format)
-        format_menu = ctk.CTkOptionMenu(quality_tab, variable=format_var, values=["mp3", "m4a", "flac", "ogg"])
-        format_menu.grid(row=2, column=1, padx=12, pady=5, sticky="ew")
-        fetch_albums_var = ctk.BooleanVar(value=self.config_manager.fetch_albums)
-        ctk.CTkSwitch(quality_tab, text="Fetch full albums for songs in the query", variable=fetch_albums_var, progress_color=ACCENT_BLUE).grid(row=3, column=0, columnspan=2, padx=12, pady=5, sticky="w")
 
-        # Provider tab
-        provider_tab = tabview.tab("Provider")
-        provider_tab.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(provider_tab, text="Audio Provider & Fallback", font=ctk.CTkFont(weight="bold"), text_color=TEXT_PRIMARY_DARK).grid(row=0, column=0, padx=12, pady=(8, 2), sticky="w")
-        ctk.CTkLabel(provider_tab, text="Primary Provider:", text_color=TEXT_SECONDARY_DARK).grid(row=1, column=0, padx=12, pady=(5, 2), sticky="w")
+        ctk.CTkLabel(quality_tab, text="Audio Format:", text_color=TEXT_SECONDARY).grid(row=2, column=0, padx=12, pady=5, sticky="w")
+        format_var = ctk.StringVar(value=self.config_manager.format)
+        # Includes opus for zero-CPU passthrough (improvement 4.2)
+        format_menu = ctk.CTkOptionMenu(quality_tab, variable=format_var, values=["mp3", "m4a", "flac", "ogg", "opus"])
+        format_menu.grid(row=2, column=1, padx=12, pady=5, sticky="ew")
+
+        # Concurrency threads (improvement 3.1)
+        ctk.CTkLabel(quality_tab, text="Download Threads:", text_color=TEXT_SECONDARY).grid(row=3, column=0, padx=12, pady=5, sticky="w")
+        threads_var = ctk.StringVar(value=str(self.config_manager.download_threads))
+        threads_menu = ctk.CTkOptionMenu(quality_tab, variable=threads_var, values=["1", "2", "4", "8", "12", "16"])
+        threads_menu.grid(row=3, column=1, padx=12, pady=5, sticky="ew")
+
+        # Skip conversion toggle (improvement 4.2)
+        skip_conversion_var = ctk.BooleanVar(value=self.config_manager.skip_conversion)
+        ctk.CTkSwitch(
+            quality_tab,
+            text="Skip audio re-encoding (Zero CPU passthrough, keep original format)",
+            variable=skip_conversion_var,
+            progress_color=ACCENT_BLUE,
+        ).grid(row=4, column=0, columnspan=2, padx=12, pady=5, sticky="w")
+
+        fetch_albums_var = ctk.BooleanVar(value=self.config_manager.fetch_albums)
+        ctk.CTkSwitch(
+            quality_tab,
+            text="Fetch full albums for songs in the query",
+            variable=fetch_albums_var,
+            progress_color=ACCENT_BLUE,
+        ).grid(row=5, column=0, columnspan=2, padx=12, pady=5, sticky="w")
+
+        # Provider & Network tab (improvements 3.2 & 3.3)
+        provider_tab = tabview.tab("Provider & Network")
+        provider_tab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(provider_tab, text="Audio Provider & Network Options", font=ctk.CTkFont(weight="bold"), text_color=TEXT_PRIMARY).grid(row=0, column=0, columnspan=2, padx=12, pady=(8, 4), sticky="w")
+
+        ctk.CTkLabel(provider_tab, text="Primary Provider:", text_color=TEXT_SECONDARY).grid(row=1, column=0, padx=12, pady=4, sticky="w")
         provider_var = ctk.StringVar(value=self.config_manager.audio_provider)
         provider_segment = ctk.CTkSegmentedButton(provider_tab, variable=provider_var, values=["youtube-music", "youtube"])
-        provider_segment.grid(row=2, column=0, padx=12, pady=(2, 5), sticky="ew")
-        ctk.CTkLabel(provider_tab, text="Overwrite Mode:", text_color=TEXT_SECONDARY_DARK).grid(row=3, column=0, padx=12, pady=(5, 2), sticky="w")
+        provider_segment.grid(row=1, column=1, padx=12, pady=4, sticky="ew")
+
+        ctk.CTkLabel(provider_tab, text="Overwrite Mode:", text_color=TEXT_SECONDARY).grid(row=2, column=0, padx=12, pady=4, sticky="w")
         overwrite_var = ctk.StringVar(value=self.config_manager.overwrite_mode)
         overwrite_segment = ctk.CTkSegmentedButton(provider_tab, variable=overwrite_var, values=["skip", "force", "metadata"])
-        overwrite_segment.grid(row=4, column=0, padx=12, pady=(2, 5), sticky="ew")
-        ctk.CTkLabel(provider_tab, text="How to handle existing files", text_color=TEXT_SECONDARY_DARK).grid(row=5, column=0, padx=12, pady=(0, 5), sticky="w")
-        fallback_var = ctk.BooleanVar(value=self.config_manager.auto_fallback)
-        ctk.CTkSwitch(provider_tab, text="Auto-fallback on failure", variable=fallback_var, progress_color=ACCENT_BLUE).grid(row=6, column=0, padx=12, pady=5, sticky="w")
+        overwrite_segment.grid(row=2, column=1, padx=12, pady=4, sticky="ew")
 
-        # Save Location tab
+        fallback_var = ctk.BooleanVar(value=self.config_manager.auto_fallback)
+        ctk.CTkSwitch(provider_tab, text="Auto-fallback to YouTube on provider error", variable=fallback_var, progress_color=ACCENT_BLUE).grid(row=3, column=0, columnspan=2, padx=12, pady=5, sticky="w")
+
+        # Proxy support (improvement 3.2)
+        ctk.CTkLabel(provider_tab, text="Proxy (optional):", text_color=TEXT_SECONDARY).grid(row=4, column=0, padx=12, pady=4, sticky="w")
+        proxy_entry = GlassEntry(provider_tab, placeholder_text="e.g. socks5://127.0.0.1:1080 or http://proxy:8080", height=30)
+        proxy_entry.insert(0, self.config_manager.proxy)
+        proxy_entry.grid(row=4, column=1, padx=12, pady=4, sticky="ew")
+
+        # Rate limit throttling (improvement 3.3)
+        ctk.CTkLabel(provider_tab, text="Bandwidth Limit:", text_color=TEXT_SECONDARY).grid(row=5, column=0, padx=12, pady=4, sticky="w")
+        rate_limit_entry = GlassEntry(provider_tab, placeholder_text="e.g. 5M for 5MB/s, empty for unlimited", height=30)
+        rate_limit_entry.insert(0, self.config_manager.rate_limit)
+        rate_limit_entry.grid(row=5, column=1, padx=12, pady=4, sticky="ew")
+
+        # Save Location tab (improvement 2.2)
         location_tab = tabview.tab("Save Location")
         location_tab.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(location_tab, text="Download Directory:", text_color=TEXT_SECONDARY_DARK).grid(row=0, column=0, padx=12, pady=(8, 2), sticky="w")
+
+        ctk.CTkLabel(location_tab, text="Download Directory:", text_color=TEXT_SECONDARY).grid(row=0, column=0, padx=12, pady=(8, 2), sticky="w")
         dir_entry = GlassEntry(location_tab, height=30)
         dir_entry.insert(0, str(self.config_manager.download_directory))
         dir_entry.grid(row=1, column=0, padx=12, pady=(2, 5), sticky="ew")
+
         browse_dir_btn = GlassButton(location_tab, text="Browse", width=90, height=26, command=lambda: self._browse_dir_dialog(dialog, dir_entry))
         browse_dir_btn.grid(row=2, column=0, padx=12, pady=(0, 5), sticky="w")
-        ctk.CTkLabel(location_tab, text="Output Template:", text_color=TEXT_SECONDARY_DARK).grid(row=3, column=0, padx=12, pady=(5, 2), sticky="w")
+
+        ctk.CTkLabel(location_tab, text="Output Template (relative to download folder):", text_color=TEXT_SECONDARY).grid(row=3, column=0, padx=12, pady=(5, 2), sticky="w")
         template_entry = GlassEntry(location_tab, height=30)
         template_entry.insert(0, self.config_manager.output_template)
         template_entry.grid(row=4, column=0, padx=12, pady=(2, 5), sticky="ew")
-        ctk.CTkLabel(location_tab, text="Template variables: {artists}, {artist}, {album}, {title}, {year}, {ext}", text_color=TEXT_SECONDARY_DARK).grid(row=5, column=0, padx=12, pady=(0, 5), sticky="w")
+        ctk.CTkLabel(location_tab, text="Variables: {artist}, {artists}, {title}, {album}, {year}, {output-ext}", text_color=TEXT_SECONDARY).grid(row=5, column=0, padx=12, pady=(0, 5), sticky="w")
 
         # Buttons Section
         btn_frame = GlassFrame(dialog_bg, corner_radius=12)
         btn_frame.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
         btn_frame.grid_columnconfigure(0, weight=1)
-        feedback_label = ctk.CTkLabel(btn_frame, text="", text_color=TEXT_SECONDARY_DARK)
+        feedback_label = ctk.CTkLabel(btn_frame, text="", text_color=TEXT_SECONDARY)
         feedback_label.grid(row=0, column=0, columnspan=3, padx=12, pady=(8, 5), sticky="ew")
 
         def save_and_apply() -> None:
+            try:
+                threads_val = int(threads_var.get())
+            except ValueError:
+                threads_val = 4
+
             updates = {
                 "bitrate": bitrate_var.get(),
                 "format": format_var.get(),
+                "download_threads": threads_val,
+                "skip_conversion": skip_conversion_var.get(),
                 "fetch_albums": fetch_albums_var.get(),
                 "audio_provider": provider_var.get(),
                 "auto_fallback": fallback_var.get(),
-                "download_directory": dir_entry.get(),
-                "output_template": template_entry.get(),
+                "proxy": proxy_entry.get().strip(),
+                "rate_limit": rate_limit_entry.get().strip(),
+                "download_directory": dir_entry.get().strip(),
+                "output_template": template_entry.get().strip(),
                 "overwrite_mode": overwrite_var.get(),
             }
             results = self.config_manager.update(updates)
@@ -623,14 +780,23 @@ class MainWindow(ctk.CTk):
                 self.spotdl_manager.set_config_manager(self.config_manager)
             else:
                 failed = [k for k, v in results.items() if not v]
-                feedback_label.configure(text=f"Failed to save: {', '.join(failed)}", text_color=ACCENT_RED)
+                feedback_label.configure(text=f"Failed to validate: {', '.join(failed)}", text_color=ACCENT_RED)
 
-        save_btn = ctk.CTkButton(btn_frame, text="Save & Apply", width=130, height=30, corner_radius=12, font=ctk.CTkFont(size=11, weight="bold"), fg_color=ACCENT_BLUE, hover_color=CTA_HOVER, command=save_and_apply)
+        save_btn = ctk.CTkButton(
+            btn_frame,
+            text="Save & Apply",
+            width=130,
+            height=30,
+            corner_radius=12,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=ACCENT_BLUE,
+            hover_color=CTA_HOVER,
+            command=save_and_apply,
+        )
         save_btn.grid(row=1, column=1, padx=8, pady=8)
         close_btn = GlassButton(btn_frame, text="Close", width=90, height=30, command=dialog.destroy)
         close_btn.grid(row=1, column=2, padx=(0, 12), pady=8)
 
-        # Grab focus only after the dialog is fully built
         dialog.grab_set()
         dialog.after(150, dialog.focus_set)
 
@@ -662,7 +828,6 @@ class MainWindow(ctk.CTk):
     def _log(self, message: str, status: str = "info") -> None:
         def _append() -> None:
             self.log_textbox.configure(state="normal")
-            # Add status prefix and color coding for visibility
             prefix = ""
             tag = "normal"
             if status == "error":
@@ -689,7 +854,7 @@ class MainWindow(ctk.CTk):
 
     def _setup_log_tags(self) -> None:
         """Set up color tags for different log message types."""
-        self.log_textbox.tag_config("normal", foreground=LOG_TEXT_NORMAL)
+        self.log_textbox.tag_config("normal", foreground=LOG_TEXT_NORMAL[1] if ctk.get_appearance_mode().lower() == "dark" else LOG_TEXT_NORMAL[0])
         self.log_textbox.tag_config("error", foreground=LOG_TEXT_ERROR)
         self.log_textbox.tag_config("warning", foreground=LOG_TEXT_WARNING)
         self.log_textbox.tag_config("success", foreground=LOG_TEXT_SUCCESS)
@@ -702,24 +867,68 @@ class MainWindow(ctk.CTk):
         self.log_textbox.configure(state="disabled")
         self.status_bar.configure(text="Log cleared")
 
-    def _refresh_session_stats(self) -> None:
-        """Recompute bytes downloaded since the session started."""
-        try:
-            total_bytes = 0
-            for dirpath, _dirnames, filenames in os.walk(self.config_manager.download_directory):
-                for filename in filenames:
-                    file_path = os.path.join(dirpath, filename)
-                    try:
-                        if os.path.getmtime(file_path) >= self._session_start:
-                            total_bytes += os.path.getsize(file_path)
-                    except OSError:
-                        continue
-            self._session_bytes = total_bytes
-            self.session_stats_label.configure(
-                text=f"Session: {self._session_files} files | {self._session_bytes / 1048576:.1f} MB"
-            )
-        except Exception:
-            pass
+    def _refresh_session_stats(self, new_file_path: Optional[str] = None) -> None:
+        """
+        Incrementally update session download stats without disk thrashing (improvement 1.2).
+        Calculates speed and ETA (improvement 5.3).
+        """
+        now = time.time()
+        added_bytes = 0
+
+        if new_file_path:
+            try:
+                p = Path(new_file_path)
+                if not p.is_absolute():
+                    p = Path(self.config_manager.download_directory) / p
+                norm_str = str(p.resolve())
+                if p.is_file() and norm_str not in self._tracked_session_files:
+                    size = p.stat().st_size
+                    self._tracked_session_files.add(norm_str)
+                    self._session_bytes += size
+                    added_bytes = size
+            except OSError:
+                pass
+        else:
+            # Check download directory for newly modified files since session start
+            try:
+                dl_dir = Path(self.config_manager.download_directory)
+                if dl_dir.is_dir():
+                    for item in dl_dir.iterdir():
+                        if item.is_file():
+                            norm_str = str(item.resolve())
+                            if norm_str not in self._tracked_session_files:
+                                try:
+                                    if item.stat().st_mtime >= self._session_start:
+                                        size = item.stat().st_size
+                                        self._tracked_session_files.add(norm_str)
+                                        self._session_bytes += size
+                                        added_bytes += size
+                                except OSError:
+                                    continue
+            except Exception:
+                pass
+
+        # Update speed and ETA
+        elapsed = now - self._last_speed_time
+        if elapsed >= 1.0 or added_bytes > 0:
+            if elapsed > 0:
+                bytes_delta = self._session_bytes - self._last_speed_bytes
+                self._current_speed_bps = max(0.0, bytes_delta / max(0.1, elapsed))
+                self._last_speed_time = now
+                self._last_speed_bytes = self._session_bytes
+
+                if self._current_speed_bps > 1048576:
+                    self.speed_label.configure(text=f"Speed: {self._current_speed_bps / 1048576:.1f} MB/s")
+                elif self._current_speed_bps > 1024:
+                    self.speed_label.configure(text=f"Speed: {self._current_speed_bps / 1024:.0f} KB/s")
+                elif self._is_downloading:
+                    self.speed_label.configure(text="Speed: Calculating...")
+                else:
+                    self.speed_label.configure(text="")
+
+        self.session_stats_label.configure(
+            text=f"Session: {self._session_files} files | {self._session_bytes / 1048576:.1f} MB"
+        )
 
     def _callback(self, status: Dict[str, Any]) -> None:
         def _update() -> None:
@@ -728,7 +937,7 @@ class MainWindow(ctk.CTk):
             percent = status.get("percent", None)
             is_fallback = status.get("fallback", False)
 
-            # Fetch-mode protocol events
+            # Fetch-mode protocol events (improvement 1.3 batch rendering)
             if stat == "fetched":
                 track = status.get("track") or {}
                 self._add_track_row(track)
@@ -752,7 +961,15 @@ class MainWindow(ctk.CTk):
                 if status.get("success"):
                     self._log(msg, status="success")
                     self._session_files += 1
-                    self._refresh_session_stats()
+
+                    # Parse downloaded file from log line for incremental stat update
+                    new_file = None
+                    file_match = re.search(r'Downloaded "([^"]+)"', msg)
+                    if file_match:
+                        raw_target = file_match.group(1)
+                        if Path(raw_target).is_file():
+                            new_file = raw_target
+                    self._refresh_session_stats(new_file)
                 elif status.get("warning"):
                     self._log(msg, status="warning")
                 else:
@@ -763,9 +980,20 @@ class MainWindow(ctk.CTk):
             # Live song counter from "N/M complete" progress lines
             songs_total = status.get("songs_total")
             if songs_total is not None:
+                done = status.get('songs_done', 0)
                 self.song_counter_label.configure(
-                    text=f"Song {status.get('songs_done', 0)} of {songs_total}"
+                    text=f"Song {done} of {songs_total}"
                 )
+                # Compute ETA if speed is available (improvement 5.3)
+                if self._current_speed_bps > 1000 and songs_total > done:
+                    remaining_songs = songs_total - done
+                    avg_song_bytes = (self._session_bytes / max(1, self._session_files)) if self._session_files > 0 else 5 * 1024 * 1024
+                    est_remaining_bytes = remaining_songs * avg_song_bytes
+                    eta_seconds = int(est_remaining_bytes / self._current_speed_bps)
+                    mins, secs = divmod(eta_seconds, 60)
+                    self.eta_label.configure(text=f"ETA: ~{mins}m {secs}s")
+                else:
+                    self.eta_label.configure(text="")
 
             # Update progress bar and percentage
             if percent is not None:
@@ -778,6 +1006,8 @@ class MainWindow(ctk.CTk):
 
             if stat == "completed":
                 if self._is_fetching:
+                    # Flush any buffered checkboxes (improvement 1.3)
+                    self._flush_pending_tracks()
                     partial = bool(status.get("partial")) or self._fetch_warnings > 0
                     if partial:
                         detail = status.get("message") or (
@@ -791,15 +1021,19 @@ class MainWindow(ctk.CTk):
                         self._end_fetch()
                     self.track_label.configure(text="Tracks fetched - select and download")
                     return
+
                 self.track_label.configure(text="Download Completed")
                 self._set_downloading_state(False)
                 self.progress_bar.set(1.0)
                 self.progress_percent_label.configure(text="100%")
+                self.speed_label.configure(text="")
+                self.eta_label.configure(text="")
                 self.status_bar.configure(text="Download completed successfully")
                 self._log(msg or "Download completed", status="success")
                 self._refresh_session_stats()
             elif stat == "error":
                 if self._is_fetching:
+                    self._flush_pending_tracks()
                     self._end_fetch()
                     self.track_label.configure(text="Fetch Failed")
                     self.status_bar.configure(text="Fetch failed - see log")
@@ -808,12 +1042,15 @@ class MainWindow(ctk.CTk):
                 err_type = status.get("type", "")
                 self.track_label.configure(text=f"Download Failed ({err_type})" if err_type else "Download Failed")
                 self._set_downloading_state(False)
+                self.speed_label.configure(text="")
+                self.eta_label.configure(text="")
                 self.status_bar.configure(text="Download failed - see log for details")
                 self._log(msg or "Download failed", status="error")
         self.after(0, _update)
 
     def _end_fetch(self, message: str = "Track list ready") -> None:
         """Restore controls after a fetch finishes (success, error or cancel)."""
+        self._flush_pending_tracks()
         self._is_fetching = False
         self.status_bar.configure(text=message)
         try:
@@ -850,6 +1087,8 @@ class MainWindow(ctk.CTk):
                         self.download_selected_btn):
                 btn.configure(state="disabled")
             self.status_bar.configure(text="Downloading...")
+            self._last_speed_time = time.time()
+            self._last_speed_bytes = self._session_bytes
         else:
             self.download_button.configure(state="normal")
             self.fetch_button.configure(state="normal")
@@ -862,7 +1101,8 @@ class MainWindow(ctk.CTk):
             self.progress_bar.set(0)
             self.progress_percent_label.configure(text="0%")
             self.song_counter_label.configure(text="Ready")
-            # Hide fallback badge when download ends
+            self.speed_label.configure(text="")
+            self.eta_label.configure(text="")
             self.fallback_badge.grid_remove()
             self._fallback_active = False
             self.status_bar.configure(text="Ready")
@@ -872,26 +1112,61 @@ class MainWindow(ctk.CTk):
         return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
     def _add_track_row(self, track: Dict[str, Any]) -> None:
-        var = ctk.BooleanVar(master=self, value=True)
-        label = f"{track.get('artist') or 'Unknown'} - {track.get('title') or 'Unknown'}"
-        label = self._truncate(label, 72)
-        album = track.get("album")
-        if album:
-            label += f"  [{self._truncate(album, 30)}]"
-        cb = ctk.CTkCheckBox(
-            self.track_scroll,
-            text=label,
-            variable=var,
-            command=self._update_select_count,
-            font=ctk.CTkFont(size=11),
-            checkbox_width=18,
-            checkbox_height=18,
-        )
-        cb.grid(row=self._fetched_count, column=0, padx=8, pady=2, sticky="w")
-        self._track_vars.append(var)
-        self._track_texts.append(track.get("url", ""))
-        self._fetched_count += 1
+        """Buffer incoming track and schedule batch rendering (improvement 1.3)."""
+        self._pending_tracks.append(track)
+        if self._batch_render_id is None:
+            self._batch_render_id = self.after(40, self._render_track_batch)
+
+    def _render_track_batch(self) -> None:
+        """Render a chunk of buffered track checkboxes to prevent UI lag (improvement 1.3)."""
+        batch = self._pending_tracks[:25]
+        self._pending_tracks = self._pending_tracks[25:]
+
+        search_query = self.track_search_entry.get().strip().lower()
+
+        for track in batch:
+            var = ctk.BooleanVar(master=self, value=True)
+            label = f"{track.get('artist') or 'Unknown'} - {track.get('title') or 'Unknown'}"
+            label = self._truncate(label, 72)
+            album = track.get("album")
+            if album:
+                label += f"  [{self._truncate(album, 30)}]"
+
+            cb = ctk.CTkCheckBox(
+                self.track_scroll,
+                text=label,
+                variable=var,
+                command=self._update_select_count,
+                font=ctk.CTkFont(size=11),
+                checkbox_width=18,
+                checkbox_height=18,
+            )
+            # Filter support while loading
+            if not search_query or search_query in label.lower():
+                cb.grid(row=self._fetched_count, column=0, padx=8, pady=2, sticky="w")
+            else:
+                cb.grid(row=self._fetched_count, column=0, padx=8, pady=2, sticky="w")
+                cb.grid_remove()
+
+            self._track_vars.append(var)
+            self._track_texts.append(track.get("url", ""))
+            self._track_checkboxes.append(cb)
+            self._fetched_count += 1
+
         self._update_select_count()
+
+        if self._pending_tracks:
+            self._batch_render_id = self.after(40, self._render_track_batch)
+        else:
+            self._batch_render_id = None
+
+    def _flush_pending_tracks(self) -> None:
+        """Immediately render all remaining buffered tracks."""
+        if self._batch_render_id is not None:
+            self.after_cancel(self._batch_render_id)
+            self._batch_render_id = None
+        while self._pending_tracks:
+            self._render_track_batch()
 
     def _update_select_count(self) -> None:
         selected = sum(1 for v in self._track_vars if v.get())
@@ -910,11 +1185,17 @@ class MainWindow(ctk.CTk):
         self._update_select_count()
 
     def _reset_selection_panel(self) -> None:
+        if self._batch_render_id is not None:
+            self.after_cancel(self._batch_render_id)
+            self._batch_render_id = None
+        self._pending_tracks = []
         for cb in self.track_scroll.winfo_children():
             cb.destroy()
         self._track_vars = []
         self._track_texts = []
+        self._track_checkboxes = []
         self._fetched_count = 0
+        self.track_search_entry.delete(0, "end")
         self._update_select_count()
 
     def _start_fetch(self) -> None:
@@ -945,6 +1226,8 @@ class MainWindow(ctk.CTk):
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start()
         self.progress_percent_label.configure(text="")
+        self.speed_label.configure(text="")
+        self.eta_label.configure(text="")
         self._log(f"Fetching tracks: {url}", status="info")
         self.spotdl_manager.set_config_manager(self.config_manager)
         self.spotdl_manager.fetch_tracks(url=url, callback=self._callback)
@@ -985,7 +1268,6 @@ class MainWindow(ctk.CTk):
             return
         output_path = self.config_manager.download_directory
         self._current_url = url
-        # Truncate URL for display if too long
         display_url = url if len(url) <= 60 else url[:57] + "..."
         self.track_label.configure(text=f"Downloading: {display_url}")
         self._log(f"Starting download: {url}", status="info")

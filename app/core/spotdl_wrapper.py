@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
+import queue
 import re
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+from app.utils.platform_utils import get_creationflags
 
 if TYPE_CHECKING:
     from app.core.config import ConfigManager
@@ -18,110 +22,39 @@ logger = logging.getLogger(__name__)
 try:
     from app.core.config import ConfigManager as _ConfigManagerImpl
 except Exception:
+    logger.warning("Could not import ConfigManager", exc_info=True)
     _ConfigManagerImpl = None  # type: ignore
 
+# Path to the extracted fetch-tracks child script
+_FETCH_CHILD_SCRIPT_PATH = str(Path(__file__).parent / "fetch_tracks_child.py")
 
-def _get_creationflags() -> int:
-    """
-    Return subprocess creation flags for Windows to hide command windows.
-    
-    Returns:
-        int: CREATE_NO_WINDOW flag on Windows, else 0.
-    """
-    if platform.system() == "Windows":
-        return subprocess.CREATE_NO_WINDOW
-    return 0
-
-
-FETCH_CHILD_SCRIPT = r"""
-import json, sys, logging
-
-def _emit(obj):
-    try:
-        sys.stdout.write(obj)
-        sys.stdout.flush()
-    except Exception:
-        pass
-
-def _safe_json(obj):
-    try:
-        return json.dumps(obj, ensure_ascii=True)
-    except (TypeError, ValueError):
-        return json.dumps(str(obj), ensure_ascii=True)
-
-class _ProtocolHandler(logging.Handler):
-    # Forward WARNING+ log records as __WARN__ protocol lines.
-    def emit(self, record):
-        try:
-            if record.levelno < logging.WARNING:
-                return
-            msg = record.getMessage()
-        except Exception:
-            msg = getattr(record, "msg", "?")
-        _emit("__WARN__" + _safe_json(str(msg)[:300]) + "\n")
-
-# Keep INFO chatter out of the protocol stream, but never lose a
-# warning/error: an unreported partial result looks like a clean fetch.
-_handler = _ProtocolHandler()
-_handler.setLevel(logging.WARNING)
-logging.basicConfig(level=logging.WARNING, handlers=[_handler], force=True)
-
-try:
-    from spotdl.utils.spotify import SpotifyClient
-    SpotifyClient.init(client_id=None, client_secret=None, user_auth=False,
-                       no_cache=True, headless=True)
-except Exception as exc:
-    _emit("__ERR__" + _safe_json("Spotify client init failed: %s" % exc) + "\n")
-    sys.exit(1)
-
-from spotdl.utils.search import parse_query
-
-queries = sys.argv[1:]
-songs = []
-failed_queries = []
-for q in queries:
-    try:
-        songs.extend(parse_query(query=[q], threads=8))
-    except KeyboardInterrupt:
-        raise
-    except BaseException as exc:
-        failed_queries.append(q)
-        _emit("__WARN__" + _safe_json("Query failed: %s (%s)" % (q[:60], exc)) + "\n")
-
-for s in songs:
-    payload = {
-        "url": getattr(s, "url", "") or "",
-        "artist": getattr(s, "artist", "") or "",
-        "title": getattr(s, "name", "") or "",
-        "album": getattr(s, "album_name", "") or "",
-        "duration": getattr(s, "duration", 0) or 0,
-    }
-    _emit("__TRACK__" + _safe_json(payload) + "\n")
-_emit("__DONE__" + json.dumps({"count": len(songs), "errors": len(failed_queries)}) + "\n")
-sys.exit(1 if (failed_queries and not songs) else 0)
-"""
+# Spotify URL validation regex (improvement 2.1)
+SPOTIFY_URL_RE = re.compile(
+    r"^https?://open\.spotify\.com/(track|album|playlist|artist)/[a-zA-Z0-9]+(\?.*)?$"
+)
 
 
 class SpotDLManager:
     """
     Thread-safe manager for executing spotDL commands via background subprocesses.
-    
+
     Provides methods to download tracks/playlists and sync playlists, with
     real-time log parsing, optional callback support, and cancellation.
     Includes auto-fallback on AudioProviderError respecting config.
     """
     # SpotDL arguments that take a value and should not be duplicated when merging
     _NON_DUPLICATE_ARGS = {"--audio", "-a", "--bitrate", "-b", "--format", "-f",
-                           "--overwrite", "--output", "-o", "--url"}
+                           "--overwrite", "--output", "-o", "--url", "--threads",
+                           "--proxy", "--max-retries"}
     # Standalone flags (no value argument) that should not be duplicated
     _NON_DUPLICATE_FLAGS = {"--force", "--skip-existing", "--dont-filter-results",
                             "--fetch-albums", "--user-auth", "--preload", "--headless",
                             "--simple-tui"}
-    
+
     def __init__(self, config_manager: Optional["ConfigManager"] = None) -> None:
         """
         Initialize SpotDLManager with no active process.
-        
+
         Args:
             config_manager: Optional ConfigManager instance to read settings from.
         """
@@ -135,6 +68,7 @@ class SpotDLManager:
             try:
                 self._config_manager = _ConfigManagerImpl()
             except Exception:
+                logger.warning("Could not create fallback ConfigManager", exc_info=True)
                 self._config_manager = None
         self._current_url: str = ""
         self._current_output_path: Path | str = ""
@@ -143,7 +77,12 @@ class SpotDLManager:
         self._lock = threading.RLock()
         # Track active streaming threads to properly wait for cleanup
         self._streaming_threads: List[threading.Thread] = []
-    
+
+    @staticmethod
+    def _validate_url(url: str) -> bool:
+        """Return True if `url` is a valid Spotify URL."""
+        return bool(SPOTIFY_URL_RE.match(url))
+
     def _get_config(self) -> Dict[str, Any]:
         """Get config values safely."""
         if self._config_manager is None:
@@ -155,6 +94,10 @@ class SpotDLManager:
                 "format": "mp3",
                 "fetch_albums": True,
                 "output_template": "{title}.{output-ext}",
+                "download_threads": 4,
+                "proxy": "",
+                "rate_limit": "",
+                "skip_conversion": False,
             }
         try:
             return {
@@ -165,8 +108,13 @@ class SpotDLManager:
                 "format": str(self._config_manager.format),
                 "fetch_albums": bool(self._config_manager.fetch_albums),
                 "output_template": str(self._config_manager.output_template),
+                "download_threads": int(self._config_manager.download_threads),
+                "proxy": str(self._config_manager.proxy),
+                "rate_limit": str(self._config_manager.rate_limit),
+                "skip_conversion": bool(self._config_manager.skip_conversion),
             }
         except Exception:
+            logger.warning("Config read failed, using defaults", exc_info=True)
             return {
                 "auto_fallback": True,
                 "audio_provider": "youtube-music",
@@ -175,8 +123,12 @@ class SpotDLManager:
                 "format": "mp3",
                 "fetch_albums": True,
                 "output_template": "{title}.{output-ext}",
+                "download_threads": 4,
+                "proxy": "",
+                "rate_limit": "",
+                "skip_conversion": False,
             }
-    
+
     def _parse_log_line(self, line: str) -> Dict[str, Any]:
         clean_line = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line).strip()
         if not clean_line:
@@ -244,7 +196,7 @@ class SpotDLManager:
         if 'warning' in lower or 'deno' in lower:
             return {"status": "downloading", "message": clean_line, "percent": percent, "warning": True}
         return {"status": "downloading", "message": clean_line, "percent": percent}
-    
+
     def _try_fallback(self, status: Dict[str, Any]) -> bool:
         """Return whether a provider fallback retry should run for this status.
 
@@ -279,10 +231,10 @@ class SpotDLManager:
         else:
             new_cmd.extend(["--audio", "youtube"])
         return new_cmd
-    
+
     def _merge_args_no_duplicates(self, base_args: List[str], extra_args: List[str]) -> List[str]:
         """Merge argument lists, removing duplicates for known conflicting args.
-        
+
         When a key exists in both base_args and extra_args, the extra_args version wins.
         Handles both value-taking args (e.g., --audio) and standalone flags (e.g., --force).
         """
@@ -299,7 +251,7 @@ class SpotDLManager:
                 i += 1
             else:
                 i += 1
-        
+
         # Filter base_args to remove any keys that are also in extra_args
         filtered_base = []
         i = 0
@@ -318,9 +270,9 @@ class SpotDLManager:
             else:
                 filtered_base.append(base_args[i])
                 i += 1
-        
+
         return filtered_base + extra_args
-    
+
     def _reset_run_state(self) -> None:
         """Reset all per-run state to defaults. Called between downloads."""
         with self._lock:
@@ -355,6 +307,27 @@ class SpotDLManager:
             except Exception:
                 pass
 
+    @staticmethod
+    def _build_spotdl_env() -> Dict[str, str]:
+        """Build an environment dict with spotDL binary directories in PATH.
+
+        spotDL installs ffmpeg/deno into ~/.spotdl or ~/.config/spotdl which
+        are not on the system PATH. We inject these directories so spotDL's
+        subprocess calls can find them.
+        """
+        env = os.environ.copy()
+        spotdl_dirs = []
+        home = Path.home()
+        for base in (home / ".config" / "spotdl", home / ".spotdl"):
+            try:
+                if base.is_dir():
+                    spotdl_dirs.append(str(base))
+            except Exception:
+                pass
+        if spotdl_dirs:
+            env["PATH"] = os.pathsep.join(spotdl_dirs) + os.pathsep + env.get("PATH", "")
+        return env
+
     def _run_command_chain(self, cmd: List[str], callback: Optional[Callable[[Dict[str, Any]], None]], error_message: str) -> None:
         """Run a spotDL command, retrying once with the YouTube provider when
         the audio provider fails.
@@ -362,17 +335,21 @@ class SpotDLManager:
         The whole chain runs in this thread: the failed subprocess is stopped
         before the retry starts, and shared state is reset only after the last
         process finishes, so the manager keeps tracking the active process.
+
+        Uses merged stdout/stderr (improvement 1.1) and injected PATH (improvement 4.1).
         """
         try:
             with self._lock:
                 self._streaming_threads.append(threading.current_thread())
+            env = self._build_spotdl_env()
             current_cmd = cmd
             while True:
                 process = subprocess.Popen(
                     current_cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=_get_creationflags(),
+                    stderr=subprocess.STDOUT,  # Merge stderr into stdout (fix 1.1)
+                    env=env,                   # Inject spotDL PATH (fix 4.1)
+                    creationflags=get_creationflags(),
                 )
                 with self._lock:
                     self._process = process
@@ -414,7 +391,7 @@ class SpotDLManager:
         finally:
             # Reset state only after the active process (and any retry) finished
             self._reset_run_state()
-    
+
     def _emit_status(
         self,
         callback: Optional[Callable[[Dict[str, Any]], None]],
@@ -507,21 +484,17 @@ class SpotDLManager:
     def _stream_output(self, process: subprocess.Popen[bytes], callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> bool:
         """Stream output from a process, calling callback for each parsed line.
 
-        Returns True when streaming stopped early because a provider fallback
-        retry was requested; the caller is then responsible for stopping the
-        process and relaunching with the fallback command.
+        Since stderr is merged into stdout (improvement 1.1), we only need to
+        read one pipe. Returns True when streaming stopped early because a
+        provider fallback retry was requested.
         """
         if process.stdout:
             if self._read_pipe_stream(process.stdout, callback) is not None:
                 return True
-        if process.stderr and not self._cancelled:
-            if self._read_pipe_stream(process.stderr, callback) is not None:
-                return True
+
         with self._lock:
             cancelled = self._cancelled
         if cancelled:
-            # The process may still be running if it started after the cancel
-            # flag was set; make sure it is stopped before returning.
             self._stop_process(process)
         else:
             try:
@@ -556,11 +529,14 @@ class SpotDLManager:
         extra.append("--simple-tui")
         bitrate = cfg.get("bitrate", "320k")
         audio_format = cfg.get("format", "mp3")
+        skip_conversion = cfg.get("skip_conversion", False)
         if fetch_albums is None:
             fetch_albums = cfg.get("fetch_albums", True)
         overwrite = cfg.get("overwrite_mode", "skip")
+
         extra.extend(["--bitrate", str(bitrate)])
-        extra.extend(["--format", str(audio_format)])
+        if not skip_conversion:
+            extra.extend(["--format", str(audio_format)])
         if fetch_albums:
             extra.append("--fetch-albums")
         overwrite_flags = {"skip", "force", "metadata"}
@@ -574,8 +550,26 @@ class SpotDLManager:
             elif overwrite == "metadata":
                 extra.append("--overwrite")
                 extra.append("metadata")
+
+        # Download concurrency (improvement 3.1)
+        threads = cfg.get("download_threads", 4)
+        extra.extend(["--threads", str(threads)])
+
+        # Retry logic (improvement 3.3)
+        extra.extend(["--max-retries", "3"])
+
+        # Proxy support (improvement 3.2)
+        proxy = cfg.get("proxy", "")
+        if proxy:
+            extra.extend(["--proxy", proxy])
+
+        # Bandwidth throttling (improvement 3.3)
+        rate_limit = cfg.get("rate_limit", "")
+        if rate_limit:
+            extra.extend(["--yt-dlp-args", f"--limit-rate {rate_limit}"])
+
         return extra
-    
+
     def download_track_or_playlist(
         self,
         url: "str | list[str]",
@@ -593,6 +587,17 @@ class SpotDLManager:
         # Wait for previous threads to fully terminate
         self._wait_for_streaming_threads(timeout=5)
         url_list = [str(u) for u in url] if isinstance(url, (list, tuple)) else [url]
+
+        # Validate all URLs before execution (improvement 2.1)
+        for u in url_list:
+            if not self._validate_url(u):
+                self._emit_status(callback, {
+                    "status": "error",
+                    "message": f"Invalid Spotify URL: {u[:80]}",
+                    "percent": None,
+                })
+                return
+
         with self._lock:
             if config_manager is not None:
                 self._config_manager = config_manager
@@ -649,28 +654,42 @@ class SpotDLManager:
         """Fetch Spotify track metadata (no audio search) and stream tracks
         back via callback as {"status": "fetched", "track": {...}} events.
 
-        Runs spotdl's metadata pipeline in a child process so it never blocks
-        or interferes with the GUI thread. Emits a "fetch_error" event on
+        Runs the fetch_tracks_child.py script in a child process so it never
+        blocks or interferes with the GUI thread. Emits a "fetch_error" event on
         failure and a "completed" event with songs_total on success.
         """
         self.cancel_download()
         self._wait_for_streaming_threads(timeout=5)
+
+        url_list = [str(u) for u in url] if isinstance(url, (list, tuple)) else [url]
+
+        # Validate all URLs before execution (improvement 2.1)
+        for u in url_list:
+            if not self._validate_url(u):
+                self._emit_status(callback, {
+                    "status": "fetch_error",
+                    "message": f"Invalid Spotify URL: {u[:80]}",
+                })
+                return
+
         with self._lock:
             self._cancelled = False
-            self._current_url = url
+            self._current_url = " ".join(url_list) if isinstance(url, (list, tuple)) else url
             self._current_callback = callback
 
         def _run():
-            url_list = [str(u) for u in url] if isinstance(url, (list, tuple)) else [url]
-            cmd = [sys.executable, "-c", FETCH_CHILD_SCRIPT, *url_list]
+            # Use the extracted child script (improvement 2.3)
+            cmd = [sys.executable, _FETCH_CHILD_SCRIPT_PATH, *url_list]
             try:
                 with self._lock:
                     self._streaming_threads.append(threading.current_thread())
+                env = self._build_spotdl_env()
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    creationflags=_get_creationflags(),
+                    env=env,
+                    creationflags=get_creationflags(),
                 )
                 with self._lock:
                     self._process = process
@@ -711,6 +730,7 @@ class SpotDLManager:
                             "message": f"Track fetch exited with code {returncode}",
                         })
             except Exception as e:
+                logger.exception("Fetch tracks failed")
                 if callback:
                     try:
                         callback({"status": "fetch_error", "message": f"Failed to start track fetch: {e}"})
@@ -721,7 +741,7 @@ class SpotDLManager:
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
-    
+
     def sync_playlist(
         self,
         sync_file: Path,
@@ -739,7 +759,7 @@ class SpotDLManager:
                 try:
                     self._config_manager = _ConfigManagerImpl()
                 except Exception:
-                    pass
+                    logger.warning("Could not create ConfigManager for sync", exc_info=True)
             cfg = self._get_config()
             self._current_url = url or str(sync_file)
             self._current_output_path = sync_file.parent
@@ -759,7 +779,8 @@ class SpotDLManager:
             provider = cfg.get("audio_provider", "youtube-music")
             cmd.extend(["--audio", provider])
             cmd.extend(["--bitrate", cfg.get("bitrate", "320k")])
-            cmd.extend(["--format", cfg.get("format", "mp3")])
+            if not cfg.get("skip_conversion", False):
+                cmd.extend(["--format", cfg.get("format", "mp3")])
             if cfg.get("fetch_albums", True):
                 cmd.append("--fetch-albums")
             overwrite = cfg.get("overwrite_mode", "skip")
@@ -773,59 +794,86 @@ class SpotDLManager:
                 cmd.append("--overwrite")
                 cmd.append("metadata")
 
+            # Download concurrency
+            threads = cfg.get("download_threads", 4)
+            cmd.extend(["--threads", str(threads)])
+            cmd.extend(["--max-retries", "3"])
+
+            proxy = cfg.get("proxy", "")
+            if proxy:
+                cmd.extend(["--proxy", proxy])
+
         self._thread = threading.Thread(
             target=self._run_command_chain,
             args=(cmd, callback, "Failed to start spotDL sync"),
             daemon=True,
         )
         self._thread.start()
-    
+
     def _wait_for_streaming_threads(self, timeout: float = 5.0) -> None:
         """Wait for all active streaming threads to finish (up to timeout)."""
         with self._lock:
             threads = list(self._streaming_threads)
-        
+
         for thread in threads:
             if thread.is_alive():
                 thread.join(timeout=timeout)
-    
+
     def cancel_download(self) -> None:
-        """Cancel the current download and clean up resources."""
+        """Cancel the current download and clean up resources.
+
+        Uses process tree termination on Windows (improvement 1.4) to ensure
+        child processes (ffmpeg, yt-dlp) are also killed.
+        """
         with self._lock:
             self._cancelled = True
             process = self._process
-        
+
         if process:
             try:
                 if platform.system() == "Windows":
-                    process.terminate()
+                    # Kill entire process tree on Windows (improvement 1.4)
                     try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                            capture_output=True,
+                            timeout=5,
+                        )
+                    except Exception:
+                        # Fallback to standard terminate/kill
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
                 else:
-                    process.terminate()
+                    import signal
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        process.terminate()
                     try:
                         process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         process.kill()
             except Exception:
-                pass
-        
+                logger.warning("Error during process cancellation", exc_info=True)
+
         # Wait for streaming threads to finish
         self._wait_for_streaming_threads(timeout=3)
-        
+
         with self._lock:
             self._process = None
             self._thread = None
             self._streaming_threads = []
-    
+
     def is_running(self) -> bool:
         with self._lock:
             if self._process is None:
                 return False
             return self._process.poll() is None
-    
+
     def set_config_manager(self, config_manager: "ConfigManager") -> None:
         with self._lock:
             self._config_manager = config_manager

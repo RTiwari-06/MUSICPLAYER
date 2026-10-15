@@ -1,0 +1,1 @@
+"""MusicPlayer application package."""

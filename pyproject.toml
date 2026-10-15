@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "music-spotdl"
+version = "1.0.0"
+description = "Desktop GUI for downloading music via spotDL"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "spotdl>=4.2.0,<5.0.0",
+    "customtkinter>=5.2.0,<6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.0",
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+music-spotdl = "main:main"
