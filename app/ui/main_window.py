@@ -618,7 +618,11 @@ class MainWindow(ctk.CTk):
             try:
                 proc = installer_func()
                 try:
+                    # Fixed: Add timeout handling to prevent indefinite blocking
                     proc.communicate(timeout=600)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
                 except Exception:
                     pass
             except Exception:
@@ -1242,15 +1246,25 @@ class MainWindow(ctk.CTk):
         if not selected:
             self._log("Error: No tracks selected", status="error")
             return
+        # Fixed: Validate URLs before attempting download
+        valid_urls = []
+        for url in selected:
+            if url and url.strip():
+                valid_urls.append(url.strip())
+        
+        if not valid_urls:
+            self._log("Error: No valid URLs found in selection", status="error")
+            return
+            
         output_path = self.config_manager.download_directory
-        self._current_url = " ".join(selected)
-        self._log(f"Downloading {len(selected)} selected track(s)", status="info")
+        self._current_url = " ".join(valid_urls)
+        self._log(f"Downloading {len(valid_urls)} selected track(s)", status="info")
         self._log(f"Output: {output_path}", status="info")
-        self.track_label.configure(text=f"Downloading {len(selected)} selected track(s)...")
+        self.track_label.configure(text=f"Downloading {len(valid_urls)} selected track(s)...")
         self._set_downloading_state(True)
         self.spotdl_manager.set_config_manager(self.config_manager)
         self.spotdl_manager.download_track_or_playlist(
-            url=selected,
+            url=valid_urls,
             output_path=Path(output_path),
             extra_args=None,
             callback=self._callback,
