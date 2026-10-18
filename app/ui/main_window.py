@@ -18,42 +18,44 @@ from app.utils import system_check
 
 logger = logging.getLogger(__name__)
 
-# Glassmorphism color palette (using CTK-compatible tuple colors for light/dark modes)
-# Format: (light_color, dark_color)
-WINDOW_BG = ("#f1f5f9", "#0f172a")
+# Gemini-style color palette (supporting light and dark modes)
+WINDOW_BG = ("#ffffff", "#131314")  # Pure white / Gemini deep gray
 
-# Glass frame backgrounds - frosted semi-transparent look
-GLASS_FRAME_BG = ("#e8f0fe", "#1e293b")  # Light frosted / dark slate
-GLASS_FRAME_BORDER = ("#c5cae1", "#334155")  # Subtle borders
+# Glass frame backgrounds
+GLASS_FRAME_BG = ("#f0f4f9", "#1e1f20")  # Google Light Gray / Gemini Surface
+GLASS_FRAME_BORDER = ("#dce1e7", "#333537")  # Subtle borders
 
 # Glass button backgrounds
-GLASS_BTN_BG = ("#f8f9ff", "#2d3749")  # Frosted effect
-GLASS_BTN_HOVER = ("#e8f0fe", "#475569")
+GLASS_BTN_BG = ("#e1e5e9", "#282a2c")
+GLASS_BTN_HOVER = ("#d1d5d9", "#3c4043")
 
 # Accent colors
-ACCENT_BLUE = "#4a90d9"
-CTA_HOVER = "#3a7bc0"
-ACCENT_RED = "#e74c3c"
-ACCENT_GREEN = "#2ecc71"
-ACCENT_ORANGE = "#f39c12"
+ACCENT_BLUE = "#1a73e8"  # Google Blue
+CTA_HOVER = "#1765cc"
+ACCENT_RED = "#d93025"
+ACCENT_GREEN = "#1e8e3e"
+ACCENT_ORANGE = "#f29900"
 
-# Typography colors (light mode, dark mode)
-TEXT_PRIMARY = ("#1a1a1a", "#e8e8e8")
-TEXT_SECONDARY = ("#555555", "#aaaaaa")
+# Typography colors
+TEXT_PRIMARY = ("#1f1f1f", "#e3e3e3")
+TEXT_SECONDARY = ("#444746", "#8e918f")
+
+# Standard corner radius for Gemini look
+GEMINI_RADIUS = 24
 
 # Log colors
-LOG_TEXT_NORMAL = ("#333333", "#d4d4d4")
-LOG_TEXT_ERROR = "#ff6b6b"
-LOG_TEXT_WARNING = "#f39c12"
-LOG_TEXT_SUCCESS = "#2ecc71"
-LOG_TEXT_FALLBACK = "#ff4757"
-LOG_TEXT_INFO = "#4fc3f7"
+LOG_TEXT_NORMAL = ("#1f1f1f", "#e3e3e3")
+LOG_TEXT_ERROR = "#d93025"
+LOG_TEXT_WARNING = "#f29900"
+LOG_TEXT_SUCCESS = "#1e8e3e"
+LOG_TEXT_FALLBACK = "#d93025"
+LOG_TEXT_INFO = "#1a73e8"
 
 
 class GlassFrame(ctk.CTkFrame):
     """A frame with glassmorphism styling supporting light and dark modes."""
 
-    def __init__(self, master: Any, corner_radius: int = 15, border_width: int = 1, **kwargs: Any) -> None:
+    def __init__(self, master: Any, corner_radius: int = GEMINI_RADIUS, border_width: int = 1, **kwargs: Any) -> None:
         super().__init__(
             master,
             corner_radius=corner_radius,
@@ -68,10 +70,10 @@ class GlassButton(ctk.CTkButton):
     """A button with glassmorphism styling supporting light and dark modes."""
 
     def __init__(self, master: Any, **kwargs: Any) -> None:
-        kwargs.setdefault("corner_radius", 12)
+        kwargs.setdefault("corner_radius", 20)
         kwargs.setdefault("border_width", 1)
         kwargs.setdefault("border_color", GLASS_FRAME_BORDER)
-        kwargs.setdefault("height", 36)
+        kwargs.setdefault("height", 38)
         kwargs.setdefault("fg_color", GLASS_BTN_BG)
         kwargs.setdefault("hover_color", GLASS_BTN_HOVER)
         kwargs.setdefault("text_color", TEXT_PRIMARY)
@@ -82,9 +84,9 @@ class GlassEntry(ctk.CTkEntry):
     """An entry widget with glassmorphism styling supporting light and dark modes."""
 
     def __init__(self, master: Any, **kwargs: Any) -> None:
-        kwargs.setdefault("corner_radius", 12)
+        kwargs.setdefault("corner_radius", GEMINI_RADIUS)
         kwargs.setdefault("border_width", 1)
-        kwargs.setdefault("height", 36)
+        kwargs.setdefault("height", 44)
         kwargs.setdefault("fg_color", GLASS_FRAME_BG)
         kwargs.setdefault("border_color", GLASS_FRAME_BORDER)
         kwargs.setdefault("text_color", TEXT_PRIMARY)
