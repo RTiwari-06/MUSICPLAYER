@@ -231,6 +231,19 @@ Released under the [MIT License](https://opensource.org/licenses/MIT). See `pypr
 - [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) — gorgeous themed widgets
 - [Python](https://www.python.org/) — and everyone who reports bugs and suggests features 💛
 
+## 👥 Contributors
+
+Thanks go to everyone who helps make this project better!
+
+<!-- ALL-CONTRIBUTORS-LIST:START -->
+| Contributor | Contributions |
+| --- | --- |
+| [**RTiwari-06**](https://github.com/RTiwari-06) 📢 | 🚧 project owner · 💡 ideas & review |
+| 🤖 **GLM** *(via [OpenCode](https://opencode.ai))* | 💻 code · 🐛 bug fixes · 🔧 PyInstaller build config · 📖 docs & README |
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+
+Want to join the list? See [Contributing](#-contributing).
+
 ---
 
 <div align="center">
