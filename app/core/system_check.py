@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import importlib.metadata
 import platform
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from app.utils.platform_utils import get_creationflags
+from app.core.platform_utils import get_creationflags, get_spotdl_command, is_frozen
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,20 @@ def check_python() -> Dict[str, Any]:
     """
     Check if Python is installed and available.
 
+    Inside a frozen bundle ``sys.executable`` is the packaged GUI itself, so
+    spawning it with ``--version`` would recursively launch the app (the
+    infinite window spawn loop); the runtime info is instead taken in-process.
+
     Returns:
         Dict[str, Any]: {"available": bool, "path": str | None, "version": str | None}.
     """
     try:
+        if is_frozen():
+            return {
+                "available": True,
+                "path": None,
+                "version": f"bundled {sys.version.split()[0]}",
+            }
         result = subprocess.run(
             [sys.executable, "--version"],
             capture_output=True,
@@ -53,10 +64,24 @@ def check_pip() -> Dict[str, Any]:
     """
     Check if pip is installed and available.
 
+    Inside a frozen bundle ``sys.executable -m pip`` re-launches the GUI
+    (recursive spawn), so the bundled pip is queried via package metadata
+    instead of spawning a subprocess.
+
     Returns:
         Dict[str, Any]: {"available": bool, "path": str | None, "version": str | None}.
     """
     try:
+        if is_frozen():
+            try:
+                pip_version = importlib.metadata.version("pip")
+            except importlib.metadata.PackageNotFoundError:
+                pip_version = None
+            return {
+                "available": pip_version is not None,
+                "path": None,
+                "version": f"pip {pip_version}" if pip_version else "bundled",
+            }
         result = subprocess.run(
             [sys.executable, "-m", "pip", "--version"],
             capture_output=True,
@@ -182,15 +207,17 @@ def check_all() -> Dict[str, Any]:
 
 def install_ffmpeg() -> subprocess.Popen[bytes]:
     """
-    Trigger spotdl to download ffmpeg via subprocess.Popen.
+    Trigger spotdl to download ffmpeg.
 
-    Runs: python -m spotdl --download-ffmpeg
+    Runs: python -m spotdl --download-ffmpeg (development) or the frozen
+    ``--spotdl`` relaunch (bundle) - never a bare ``sys.executable`` spawn,
+    which in a bundle would recursively open the GUI.
 
     Returns:
         subprocess.Popen[bytes]: The Popen instance for the installation process.
     """
     return subprocess.Popen(
-        [sys.executable, "-m", "spotdl", "--download-ffmpeg"],
+        get_spotdl_command(["--download-ffmpeg"]),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         creationflags=get_creationflags(),
@@ -199,15 +226,16 @@ def install_ffmpeg() -> subprocess.Popen[bytes]:
 
 def install_deno() -> subprocess.Popen[bytes]:
     """
-    Trigger spotdl to download deno via subprocess.Popen.
+    Trigger spotdl to download deno.
 
-    Runs: python -m spotdl --download-deno
+    Runs: python -m spotdl --download-deno (development) or the frozen
+    ``--spotdl`` relaunch (bundle).
 
     Returns:
         subprocess.Popen[bytes]: The Popen instance for the installation process.
     """
     return subprocess.Popen(
-        [sys.executable, "-m", "spotdl", "--download-deno"],
+        get_spotdl_command(["--download-deno"]),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         creationflags=get_creationflags(),

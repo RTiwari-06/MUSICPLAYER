@@ -1,71 +1,121 @@
+"""SpotDL_GUI application entry point.
+
+Production-safe falloff for running as both a console script in development
+and a PyInstaller-frozen ``--windowed`` executable.
+
+In a frozen build the process can be re-entered in three roles:
+
+* default role          – runs the GUI after ``freeze_support()`` guards the
+                          multiprocessing bootstrap.
+* real child process    – a ``spawn``-based multiprocessing worker created by
+                          the ``multiprocessing`` machinery; it runs the main
+                          script again as ``__mp_main__``, in which case
+                          ``__name__`` is NOT ``"__main__"`` and nothing below
+                          the guard executes.
+* fetch child process   – ``SpotDLManager.fetch_tracks()`` relaunches the
+                          packaged executable as
+                          ``<exe> --fetch-child <url>...``; the arg dispatch
+                          below routes that to the metadata protocol child.
+* spotdl child process  – ``SpotDLManager`` / ``system_check`` relaunch the
+                          packaged executable as ``<exe> --spotdl <args>``
+                          to run the bundled spotDL CLI without a GUI.
+"""
+
 from __future__ import annotations
 
-import logging
 import os
 import sys
+import multiprocessing
 from pathlib import Path
 
-# Ensure project root in sys.path
-PROJECT_ROOT = Path(__file__).parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Fix relative path resolution for PyInstaller bundle context.
+# Notes:
+# * ``sys._MEIPASS`` is the onefile extraction dir (or onedir "_internal" in
+#   PyInstaller >= 6), so chdir'ing there keeps asset lookups that assume a
+#   relative CWD working and stops writes landing next to the .exe,
+# * the ``sys.executable``-based fallback (onedir / non-PyInstaller frozen) is
+#   the location of the real bundle so relative assets still resolve.
+if getattr(sys, "frozen", False):
+    _MEIPASS = getattr(sys, "_MEIPASS", None)
+    BUNDLE_DIR = Path(_MEIPASS) if _MEIPASS else Path(sys.executable).parent
+    os.chdir(BUNDLE_DIR)
 
-from app.ui.main_window import MainWindow
-from app.utils import system_check
+# Argv dispatch for the frozen relaunch roles
+_FETCH_CHILD_FLAG = "--fetch-child"
+_SPOTDL_FLAG = "--spotdl"
 
 
-def _setup_logging() -> None:
+def _restore_stdio() -> None:
+    """Rebuild std streams nulled out by PyInstaller ``--windowed`` mode.
+
+    The fetch protocol child prints structured lines on stdout; PyInstaller
+    ``--noconsole`` builds replace stdout/stderr with ``None``, so messages
+    become no-ops and the parent sees an empty (hanging) fetch. Re-opening the
+    underlying console handles restores the stream protocol.
     """
-    Configure application-wide logging with file output and console.
+    for name, fd in (("stdout", 1), ("stderr", 2)):
+        if getattr(sys, name, None) is None:
+            try:
+                stream = open(os.dup(fd), "w", encoding="utf-8", errors="replace")
+                setattr(sys, name, stream)
+            except OSError:
+                pass
 
-    Logs are written to the platform-appropriate config directory
-    (~/.config/musicplayer/logs/ on Linux, %LOCALAPPDATA%/MusicPlayer/logs/ on Windows).
+
+def _run_fetch_child(urls: list[str]) -> None:
+    """Slave mode: execute the standalone fetch-tracks child protocol.
+
+    Properly exits with the child's exit code so the parent never mistakes a
+    crash for an empty track list.
     """
-    try:
-        home = Path.home()
-        if os.name == "nt":
-            log_dir = home / "AppData" / "Local" / "MusicPlayer" / "logs"
-        else:
-            log_dir = home / ".config" / "musicplayer" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "app.log"
-    except Exception:
-        log_file = Path.cwd() / "app.log"
+    _restore_stdio()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
+    from app.core.fetch_tracks_child import main as fetch_child_main
+
+    sys.argv = [sys.argv[0], *urls]
+    fetch_child_main()
+    sys.exit(0)
+
+
+def _run_spotdl_module(args: list[str]) -> None:
+    """Frozen relaunch role: run the bundled spotDL CLI.
+
+    spotDL commands cannot be spawned as ``python -m spotdl`` inside a PyInstaller
+    bundle, so ``SpotDLManager`` / ``system_check`` re-launch the packaged
+    executable with ``--spotdl <args>`` and this role executes the CLI entry
+    point in-process (streamable over the child's stdout, killable by PID).
+    """
+    _restore_stdio()
+
+    # Replay "python -m spotdl <args>": the console entry point reads sys.argv.
+    sys.argv = ["spotdl", *args]
+
+    from spotdl.console import console_entry_point
+
+    console_entry_point()
+    sys.exit(0)
 
 
 def main() -> None:
-    """
-    Application entry point.
+    """Entry point: route to the fetch child for frozen relaunch, else the GUI."""
+    if sys.argv[1:2] == [_FETCH_CHILD_FLAG]:
+        _run_fetch_child(sys.argv[2:])
+        return
 
-    Configures logging, verifies system environment on launch and starts
-    the main GUI loop.
-    """
-    _setup_logging()
+    if sys.argv[1:2] == [_SPOTDL_FLAG]:
+        _run_spotdl_module(sys.argv[2:])
+        return
 
-    # Verify system environment (creates settings context via system_check)
-    try:
-        _ = system_check.check_all()
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "System check failed at startup", exc_info=True
-        )
+    # Import UI modules only after freeze_support / dispatch (kept out of the
+    # child role entirely, ensuring no Tk window survives in a spawned child).
+    from app.ui.main_window import MainWindow
 
     app = MainWindow()
-    try:
-        app.mainloop()
-    except KeyboardInterrupt:
-        # Ctrl+C in the launching terminal: close the window cleanly
-        app.destroy()
+    app.mainloop()
 
 
 if __name__ == "__main__":
+    # Prevent infinite process spawning loops on Windows (PyInstaller freeze_support
+    # short-circuits the spawn-style re-exec for real multiprocessing children).
+    multiprocessing.freeze_support()
     main()

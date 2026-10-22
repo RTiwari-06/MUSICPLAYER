@@ -4,17 +4,20 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import customtkinter as ctk
-from tkinter import filedialog
+from PIL import Image
+from tkinter import PhotoImage, filedialog
 
 from app.core.config import ConfigManager
 from app.core.spotdl_wrapper import SpotDLManager
-from app.utils import system_check
+from app.core.platform_utils import apply_windows_icon, is_windows
+from app.core import system_check
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,47 @@ CTA_HOVER = LIQUID_VIOLET
 ACCENT_RED = "#f43f5e"
 ACCENT_GREEN = LIQUID_EMERALD
 TEXT_PRIMARY = ("#172033", "#f8fafc")
-TEXT_SECONDARY = ("#526176", "#94a3b8")
+TEXT_SECONDARY = "#94a3b8"
+
+PREFERRED_COLOR_THEME = "black"
+FALLBACK_COLOR_THEME = "blue"
+
+
+def resolve_color_theme(preferred: str = PREFERRED_COLOR_THEME, fallback: str = FALLBACK_COLOR_THEME) -> str:
+    """
+    Pick a customtkinter color theme that ships with the installed version.
+
+    Args:
+        preferred: Theme name to use when the installed customtkinter provides it.
+        fallback: Theme name used otherwise.
+
+    Returns:
+        str: Name of an available theme.
+    """
+    theme_dir = Path(ctk.__file__).parent / "assets" / "themes"
+    available = {path.stem for path in theme_dir.glob("*.json")} if theme_dir.is_dir() else set()
+    if preferred in available:
+        return preferred
+    if fallback in available:
+        return fallback
+    return "blue"
+
+
+def asset_path(name: str) -> Path:
+    """
+    Return the absolute path of a bundled asset.
+
+    Resolves inside ``app/assets`` when running from source and inside the
+    PyInstaller extraction folder (``sys._MEIPASS``) when running frozen.
+
+    Args:
+        name: File name inside ``app/assets``.
+
+    Returns:
+        Path: Absolute path of the asset (the file may not exist).
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / "assets" / name
 
 
 class GlassFrame(ctk.CTkFrame):
@@ -101,11 +144,11 @@ class MainWindow(ctk.CTk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("MusicPlayer - Spotify Downloader")
-        self.geometry("1280x800")
-        self.minsize(980, 650)
+        self.title("SpotDL Downloader")
+        self.geometry("1920x1080")
+        self.minsize(720, 480)
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
+        ctk.set_default_color_theme(resolve_color_theme())
         self.configure(fg_color=WINDOW_BG)
 
         self.config_manager = ConfigManager()
@@ -120,6 +163,7 @@ class MainWindow(ctk.CTk):
         self._track_checkboxes: list[ctk.CTkCheckBox] = []
         self._track_status_labels: list[LiquidPill] = []
         self._track_rows: list[ctk.CTkFrame] = []
+        self.track_search_text: Dict[ctk.CTkFrame, str] = {}
         self._session_start = time.time()
         self._session_files = 0
         self._session_bytes = 0
@@ -128,6 +172,8 @@ class MainWindow(ctk.CTk):
         self._last_speed_bytes = 0
         self._current_speed_bps = 0.0
         self._terminal_visible = False
+        self._icon_image: Optional[PhotoImage] = None
+        self._logo_image: Optional[ctk.CTkImage] = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -144,6 +190,7 @@ class MainWindow(ctk.CTk):
         self._build_progress_section()
         self._build_log_section()
         self._build_footer()
+        self._apply_window_icon()
 
         self.bind("<Control-v>", self._paste_and_focus)
         self.bind("<Return>", lambda _event: self._start_download())
@@ -152,15 +199,71 @@ class MainWindow(ctk.CTk):
         self.bind("<Control-s>", lambda _event: self._open_settings())
         self._update_system_status()
 
+    def _apply_window_icon(self) -> None:
+        """Apply the bundled icon to the window, title bar and taskbar entry."""
+        png = asset_path("icon.png")
+        ico = asset_path("icon.ico")
+
+        if is_windows() and ico.is_file():
+            try:
+                # "wm iconbitmap -default" only reaches windows created later on,
+                # so the icon is set on this window explicitly.
+                self.iconbitmap(str(ico))
+            except Exception:
+                logger.debug("Could not apply the ICO window icon", exc_info=True)
+            self.bind("<Map>", self._on_window_mapped, add="+")
+            self.after(150, self._set_exact_window_icons)
+            return
+
+        if png.is_file():
+            try:
+                self._icon_image = PhotoImage(file=str(png))
+                self.iconphoto(True, self._icon_image)
+            except Exception:
+                logger.debug("Could not apply the PNG window icon", exc_info=True)
+
+    def _on_window_mapped(self, _event: Any = None) -> None:
+        """Re-apply the window icons once the top-level window exists."""
+        self.after(150, self._set_exact_window_icons)
+
+    def _set_exact_window_icons(self) -> None:
+        """Set the title bar and taskbar icons in the exact sizes Windows wants."""
+        ico = asset_path("icon.ico")
+        if not is_windows() or not ico.is_file():
+            return
+        try:
+            apply_windows_icon(self.winfo_id(), str(ico))
+        except Exception:
+            logger.debug("Could not apply the scaled Windows icons", exc_info=True)
+
+    def _load_logo_image(self) -> Optional[ctk.CTkImage]:
+        """Load the app logo for the header, if the asset is available."""
+        png = asset_path("icon.png")
+        if not png.is_file():
+            return None
+        try:
+            with Image.open(png) as source:
+                light = source.copy()
+                dark = source.copy()
+            return ctk.CTkImage(light_image=light, dark_image=dark, size=(40, 40))
+        except Exception:
+            logger.debug("Could not load the logo image", exc_info=True)
+            return None
+
     def _build_header(self) -> None:
         self.header_frame = GlassFrame(self.main_container)
         self.header_frame.grid(row=0, column=0, columnspan=2, pady=(0, 12), sticky="ew")
         self.header_frame.grid_columnconfigure(1, weight=1)
         title_group = ctk.CTkFrame(self.header_frame, fg_color="transparent")
         title_group.grid(row=0, column=0, padx=16, pady=9, sticky="w")
-        ctk.CTkLabel(title_group, text="DL", width=38, height=38, corner_radius=14,
-                     fg_color=LIQUID_VIOLET, text_color="white",
-                     font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, rowspan=2, padx=(0, 10))
+        self._logo_image = self._load_logo_image()
+        if self._logo_image is not None:
+            ctk.CTkLabel(title_group, image=self._logo_image, width=40, height=40).grid(
+                row=0, column=0, rowspan=2, padx=(0, 10))
+        else:
+            ctk.CTkLabel(title_group, text="DL", width=38, height=38, corner_radius=14,
+                         fg_color=LIQUID_VIOLET, text_color="white",
+                         font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, rowspan=2, padx=(0, 10))
         title_line = ctk.CTkFrame(title_group, fg_color="transparent")
         title_line.grid(row=0, column=1, sticky="w")
         ctk.CTkLabel(title_line, text="Download Dashboard", font=ctk.CTkFont(size=20, weight="bold"),
@@ -435,7 +538,7 @@ class MainWindow(ctk.CTk):
         feedback.grid(row=9, column=0, columnspan=2, padx=16, pady=8)
 
         def save() -> None:
-            updates = {key: variable.get() for key, variable in variables.items()}
+            updates: Dict[str, Any] = {key: variable.get() for key, variable in variables.items()}
             updates["auto_fallback"] = fallback_var.get()
             updates["download_directory"] = directory_entry.get().strip()
             updates["output_template"] = template_entry.get().strip()
@@ -482,6 +585,7 @@ class MainWindow(ctk.CTk):
         self._track_checkboxes.clear()
         self._track_status_labels.clear()
         self._track_rows.clear()
+        self.track_search_text.clear()
         self._fetched_count = 0
         self._fetch_warnings = 0
         self.selection_summary.configure(text="0 / 0 Selected")
@@ -497,7 +601,7 @@ class MainWindow(ctk.CTk):
         variable = ctk.BooleanVar(value=True)
         row = ctk.CTkFrame(self.track_scroll, fg_color="transparent", corner_radius=0)
         row.grid(row=self._fetched_count, column=0, columnspan=6, sticky="ew")
-        row._track_search_text = f"{title} {artist} {album}".lower()
+        self.track_search_text[row] = f"{title} {artist} {album}".lower()
         row.grid_columnconfigure(1, weight=3)
         row.grid_columnconfigure(2, weight=2)
         checkbox = ctk.CTkCheckBox(row, text="", variable=variable, width=22, checkbox_width=18, checkbox_height=18,
@@ -549,7 +653,7 @@ class MainWindow(ctk.CTk):
     def _filter_tracks(self, _event: Optional[Any] = None) -> None:
         query = self.track_search.get().strip().lower()
         for row in self._track_rows:
-            visible = not query or query in row._track_search_text
+            visible = not query or query in self.track_search_text.get(row, "")
             if visible:
                 row.grid()
             else:

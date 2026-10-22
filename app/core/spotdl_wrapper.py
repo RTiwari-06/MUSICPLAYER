@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from app.utils.platform_utils import get_creationflags
+from app.core.platform_utils import get_creationflags, get_spotdl_command, is_frozen
 
 if TYPE_CHECKING:
     from app.core.config import ConfigManager
@@ -27,6 +27,28 @@ except Exception:
 
 # Path to the extracted fetch-tracks child script
 _FETCH_CHILD_SCRIPT_PATH = str(Path(__file__).parent / "fetch_tracks_child.py")
+
+# Flag used by the frozen build to re-launch itself as the fetch child
+_FETCH_CHILD_FLAG = "--fetch-child"
+
+
+def _fetch_child_command(url_list: List[str]) -> List[str]:
+    """
+    Build the command line used to spawn the metadata fetch child process.
+
+    A frozen build re-launches the packaged executable with the
+    ``--fetch-child`` flag (routed by ``main.py`` to the child role so no GUI
+    is created); in development the standalone child script is spawned.
+
+    Args:
+        url_list: Spotify URLs to resolve.
+
+    Returns:
+        List[str]: Command and arguments.
+    """
+    if is_frozen():
+        return [sys.executable, _FETCH_CHILD_FLAG, *url_list]
+    return [sys.executable, _FETCH_CHILD_SCRIPT_PATH, *url_list]
 
 # Spotify URL validation regex (improvement 2.1)
 SPOTIFY_URL_RE = re.compile(
@@ -521,6 +543,7 @@ class SpotDLManager:
                     "percent": None,
                     "type": "ProcessError",
                 })
+        return False
 
     def _build_base_extra_args(self, cfg: Dict[str, Any], fetch_albums: Optional[bool] = None) -> List[str]:
         extra: List[str] = []
@@ -626,17 +649,14 @@ class SpotDLManager:
             output_template = cfg.get(
                 "output_template", "{title}.{output-ext}"
             ).replace("{ext}", "{output-ext}")
-            cmd = [
-                sys.executable,
-                "-m",
-                "spotdl",
+            cmd = get_spotdl_command([
                 # explicit subcommand: this build treats the first positional
                 # as the operation, so extra query URLs would be rejected
                 "download",
                 *url_list,
                 "--output",
                 str(self._current_output_path / output_template),
-            ]
+            ])
             cmd.extend(final_extra)
 
         self._thread = threading.Thread(
@@ -679,7 +699,7 @@ class SpotDLManager:
 
         def _run():
             # Use the extracted child script (improvement 2.3)
-            cmd = [sys.executable, _FETCH_CHILD_SCRIPT_PATH, *url_list]
+            cmd = _fetch_child_command(url_list)
             try:
                 with self._lock:
                     self._streaming_threads.append(threading.current_thread())
@@ -766,14 +786,11 @@ class SpotDLManager:
             self._current_callback = callback
             self._fallback_attempts = 0
             self._cancelled = False
-            cmd = [
-                sys.executable,
-                "-m",
-                "spotdl",
+            cmd = get_spotdl_command([
                 "sync",
                 str(sync_file),
                 "--simple-tui",
-            ]
+            ])
             if url:
                 cmd.append(url)
             provider = cfg.get("audio_provider", "youtube-music")
@@ -836,7 +853,7 @@ class SpotDLManager:
                     try:
                         subprocess.run(
                             ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
+                            creationflags=get_creationflags(),
                             capture_output=True,
                             timeout=5,
                         )
@@ -849,8 +866,12 @@ class SpotDLManager:
                             process.kill()
                 else:
                     import signal
+                    killpg = getattr(os, "killpg", None)
+                    getpgid = getattr(os, "getpgid", None)
                     try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        if killpg is None or getpgid is None:
+                            raise AttributeError("process group control is unavailable")
+                        killpg(getpgid(process.pid), signal.SIGTERM)
                     except (ProcessLookupError, PermissionError):
                         process.terminate()
                     try:

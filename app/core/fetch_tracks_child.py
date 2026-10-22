@@ -54,8 +54,8 @@ def main() -> None:
     try:
         from spotdl.utils.spotify import SpotifyClient
         SpotifyClient.init(
-            client_id=None,
-            client_secret=None,
+            client_id=None,  # type: ignore[arg-type]
+            client_secret=None,  # type: ignore[arg-type]
             user_auth=False,
             no_cache=True,
             headless=True,
