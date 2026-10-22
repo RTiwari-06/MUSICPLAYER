@@ -42,7 +42,7 @@ if exist "SpotDL-GUI.spec" del /q "SpotDL-GUI.spec"
 echo [MusicPlayer] Building Windows executable with PyInstaller...
 "%PYTHON_CMD%" -m pip install --upgrade pyinstaller
 "%PYTHON_CMD%" -m PyInstaller --noconfirm --clean --windowed ^
-    --name MusicPlayer ^
+    --name SpotDL_GUI ^
     --icon "app\assets\icon.ico" ^
     --add-data "app\assets\icon.png;assets" ^
     --add-data "app\assets\icon.ico;assets" ^
@@ -62,7 +62,7 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo [MusicPlayer] Build finished: dist\MusicPlayer\MusicPlayer.exe
+echo [MusicPlayer] Build finished: dist\SpotDL_GUI\SpotDL_GUI.exe
 goto :eof
 
 :clean

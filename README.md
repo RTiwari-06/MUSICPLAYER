@@ -99,7 +99,7 @@ Files are organized by **artist → album** by default, honoring your configured
 MusicPlayer.bat build
 ```
 
-Produces `dist/MusicPlayer/MusicPlayer.exe` with the application icon applied:
+Produces `dist/SpotDL_GUI/SpotDL_GUI.exe` with the application icon applied:
 
 - Only runtime assets (`icon.png`, `icon.ico`) are bundled — `icon_source.png` stays out of the executable.
 - The frozen executable resolves assets from the PyInstaller extraction folder and re-launches itself with `--fetch-child`
