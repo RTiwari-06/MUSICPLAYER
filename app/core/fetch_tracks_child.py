@@ -44,9 +44,29 @@ class _ProtocolHandler(logging.Handler):
         _emit("__WARN__" + _safe_json(str(msg)[:300]) + "\n")
 
 
+def _restore_child_stdio() -> None:
+    """Best-effort: force child std streams to UTF-8 with lossless decoding.
+
+    On Windows a piped stdout defaults to the locale codec (cp1252), which can
+    raise on Unicode titles/album names before the parent ever sees the line.
+    ``ensure_ascii`` payloads make this safety net redundant, but any stray
+    ``print``/log sink remains UTF-8 clean.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main() -> None:
     # Keep INFO chatter out of the protocol stream, but never lose a
     # warning/error: an unreported partial result looks like a clean fetch.
+    _restore_child_stdio()
     _handler = _ProtocolHandler()
     _handler.setLevel(logging.WARNING)
     logging.basicConfig(level=logging.WARNING, handlers=[_handler], force=True)
@@ -94,7 +114,7 @@ def main() -> None:
 
     _emit(
         "__DONE__"
-        + json.dumps({"count": len(songs), "errors": len(failed_queries)})
+        + _safe_json({"count": len(songs), "errors": len(failed_queries)})
         + "\n"
     )
     sys.exit(1 if (failed_queries and not songs) else 0)

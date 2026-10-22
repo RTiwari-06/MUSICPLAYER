@@ -34,9 +34,12 @@ echo [MusicPlayer] Dependencies installed.
 goto :eof
 
 :build
+echo [MusicPlayer] Cleaning previous build artifacts...
+if exist "build" rmdir /s /q "build"
+if exist "dist" rmdir /s /q "dist"
+if exist "SpotDL_GUI.spec" del /q "SpotDL_GUI.spec"
+if exist "SpotDL-GUI.spec" del /q "SpotDL-GUI.spec"
 echo [MusicPlayer] Building Windows executable with PyInstaller...
-if not exist "build" mkdir "build"
-if not exist "dist" mkdir "dist"
 "%PYTHON_CMD%" -m pip install --upgrade pyinstaller
 "%PYTHON_CMD%" -m PyInstaller --noconfirm --clean --windowed ^
     --name MusicPlayer ^
@@ -46,8 +49,12 @@ if not exist "dist" mkdir "dist"
     --collect-all spotdl ^
     --collect-all yt_dlp ^
     --collect-all pykakasi ^
-    --hidden-import app.core.fetch_tracks_child ^
+    --collect-data pykakasi ^
+    --hidden-import spotdl ^
+    --hidden-import yt_dlp ^
+    --hidden-import ytmusicapi ^
     --hidden-import customtkinter ^
+    --hidden-import app.core.fetch_tracks_child ^
     main.py
 if errorlevel 1 (
     echo.
@@ -62,5 +69,7 @@ goto :eof
 echo [MusicPlayer] Removing build artifacts...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
+if exist "SpotDL_GUI.spec" del /q "SpotDL_GUI.spec"
+if exist "SpotDL-GUI.spec" del /q "SpotDL-GUI.spec"
 echo [MusicPlayer] Clean done.
 goto :eof

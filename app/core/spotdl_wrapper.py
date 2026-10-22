@@ -336,8 +336,17 @@ class SpotDLManager:
         spotDL installs ffmpeg/deno into ~/.spotdl or ~/.config/spotdl which
         are not on the system PATH. We inject these directories so spotDL's
         subprocess calls can find them.
+
+        Additionally forces UTF-8 child I/O: Windows pipes default to the
+        locale codec (cp1252), so children emitting non-ASCII titles could
+        either raise UnicodeEncodeError or encode bytes that the parent's
+        utf-8/replace decoder mangles. PYTHONIOENCODING/PYTHONUTF8 pin the
+        child streams to UTF-8; the parent side decodes with
+        ``errors='replace'`` regardless.
         """
         env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         spotdl_dirs = []
         home = Path.home()
         for base in (home / ".config" / "spotdl", home / ".spotdl"):
