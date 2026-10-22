@@ -58,7 +58,7 @@ while spotDL does the lifting.
 ### Install & run
 
 ```bash
-git clone https://github.com/RTiwari-06/MUSICPLAYER.git
+git clone https://github.com/RTiwari-06/SpotDL_UI.git
 cd MUSICPLAYER
 python -m pip install -r requirements.txt
 python main.py
